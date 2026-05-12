@@ -1,0 +1,20 @@
+[package]
+name = "sumcheck"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Educational implementation of the multilinear sumcheck protocol (Lund-Fortnow-Karloff-Nisan 1992)"
+
+[dependencies]
+rand = "0.8"
+
+[dev-dependencies]
+proptest = "1.4"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"

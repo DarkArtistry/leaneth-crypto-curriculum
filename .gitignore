@@ -1,0 +1,20 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Claude tooling / state
+.claude/
+.claude.local.md
+CLAUDE.md
+
+# Curriculum doc (kept private)
+coding_plan.md
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo

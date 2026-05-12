@@ -1,0 +1,20 @@
+[package]
+name = "reed_solomon"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Educational implementation of Reed-Solomon codes with FFT-based encoding over the Goldilocks field"
+
+[dependencies]
+rand = "0.8"
+
+[dev-dependencies]
+proptest = "1.4"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"

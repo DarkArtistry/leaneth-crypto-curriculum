@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "sumcheck",
+    "reed_solomon",
+]
+
+# Future objectives will be added here as you complete them:
+# "stir",
+# "whir",
+# "stark",
+# "stark_whir",
+# "xmss",
+# "lean_eth",
+
+[workspace.package]
+edition = "2021"
+authors = ["Kenneth Goh Zhen Hao <e0486543@u.nus.edu>"]
+license = "MIT"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

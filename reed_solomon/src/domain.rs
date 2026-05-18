@@ -24,9 +24,12 @@
 //!
 //! ## What is a coset, exactly?
 //!
-//! Mental model: **a coset is a translated copy of a subgroup.** In an
-//! abelian group like `F_p^*` under multiplication, "translation" means
-//! multiplication by a fixed element `c`.
+//! ### Mental model: a translated copy of a subgroup
+//!
+//! In an abelian group like `F_p^*` under multiplication, "translation"
+//! means multiplication by a fixed element `c`. A **coset** of a
+//! subgroup `H` by `c` is the set you get when you multiply every
+//! element of `H` by `c` — same shape, shifted location.
 //!
 //! ### Worked example in `F_17`
 //!
@@ -75,6 +78,18 @@
 //! **Lagrange's theorem**: cosets of a subgroup partition the parent
 //! group into equal-sized chunks.
 //!
+//! **Question for the reader.** In `F_17^*`, the subgroup `⟨ω⟩ = {1, 4, 16, 13}`
+//! with `ω = 4` (a primitive 4th root). Multiply every element by `c = 2`.
+//! What set do you get? Why is it the same *size* as the subgroup but *no
+//! longer closed under multiplication*?
+//! Try to answer before reading on.
+//!
+//! Answer: `c·⟨ω⟩ = {2, 8, 15, 9}` (compute `2·1 = 2, 2·4 = 8, 2·16 = 32 ≡ 15,
+//! 2·13 = 26 ≡ 9 mod 17`). Same size four because `c` is non-zero and
+//! `F_17^*` is a group, so multiplication by `c` is a bijection. Closure
+//! fails because, e.g., `2 · 2 = 4 ∉ {2, 8, 15, 9}` — products of two
+//! elements of `c·H` land in `c² · H`, a *different* coset.
+//!
 //! ### Abstract definition
 //!
 //! For a group `G` and a subgroup `H ≤ G`, the **(left) coset** of `H`
@@ -92,6 +107,97 @@
 //!   subgroup viewed as one of its own cosets).
 //! - If `c ∉ H`, then `cH ∩ H = ∅` — a **proper coset**, disjoint from `H`.
 //! - Any two cosets of the same `H` are either identical or disjoint.
+//!
+//! ### Two precise facts: not a group, but in set-bijection with `H`
+//!
+//! The "translated copy of a subgroup" picture is a useful first
+//! mental model, but it's slightly imprecise. Two facts about the
+//! coset `cH` carry the whole FRI / RS story, and the contrast
+//! between them is what most pedagogical accounts gloss over:
+//!
+//! 1. **A coset is *not* a group.** When `c ∉ H`, `cH` fails the
+//!    group axioms in two distinct ways:
+//!    - **No identity.** `1 ∈ cH` would require some `h ∈ H` with
+//!      `c·h = 1`, i.e. `h = c^{-1}` — which lies in `H` only when
+//!      `c ∈ H`. On the `F_17` example, `1 ∉ cH = {3, 12, 14, 5}` ✓.
+//!    - **Not closed under multiplication.**
+//!      `(c·h_1) · (c·h_2) = c^2·(h_1·h_2)` sits in `c^2·H`, a
+//!      *different* coset of `H`. On `F_17`: `3 · 5 = 15`, and
+//!      `15 ∉ cH = {3, 12, 14, 5}` ✓.
+//!
+//! 2. ***But* `cH` *is* in set-bijection with `H`.** The map
+//!    `φ: H → cH` defined by `φ(h) = c·h` is a perfect one-to-one
+//!    correspondence, with inverse `φ^{-1}(x) = c^{-1}·x`. It is
+//!    **not** a group homomorphism — the target has no group
+//!    structure to be a homomorphism *into* — but it **is** an
+//!    **isomorphism of sets**.
+//!
+//! The algebraic *axioms* of `H` do not transfer to `cH` — that's (1).
+//! The *set-shape* of `H` does transfer, via `φ` — that's (2). A
+//! common slip is to call `H` and `cH` "homomorphic"; that would
+//! require group structure on both sides, which `cH` precisely
+//! doesn't have. The right word is **isomorphic as sets**.
+//!
+//! ### What the bijection buys FFT, FRI, and Reed-Solomon
+//!
+//! Two properties FFT, FRI, and Reed-Solomon care about — both
+//! preserved by `φ` even though group structure isn't:
+//!
+//! - **`n` distinct nonzero points.** Multiplication by the nonzero
+//!   `c` is injective on `F_p^*`, so `|cH| = |H| = n` and no element
+//!   of `cH` collapses to zero.
+//! - **Polynomial evaluation transports cleanly.** Evaluating `p(X)`
+//!   on `cH` equals evaluating `p(cX)` on `H`. That is exactly the
+//!   "pre-scale the coefficients by powers of `c`" trick the FFT
+//!   module relies on — one algorithm, two domain shapes.
+//!
+//! ### Reed-Solomon distance is set-theoretic
+//!
+//! The Reed-Solomon minimum-distance theorem only asks for `n`
+//! **distinct nonzero** evaluation points; group structure plays no
+//! role. By the **polynomial root bound** (a nonzero degree-`<d`
+//! polynomial over a field has at most `d - 1` roots), two distinct
+//! degree-`<d` polynomials agree on at most `d - 1` of any `n`
+//! distinct points. The minimum distance is `n - d + 1` on a
+//! subgroup or on a coset — same number, same Berlekamp-Welch
+//! decoder, no change.
+//!
+//! ### FRI folding and the squaring map on cosets
+//!
+//! FRI halves the domain at each round via the squaring map
+//! `x → x^2`. On the coset `cH`,
+//!
+//! ```text
+//! (c · ω^i)^2  =  c^2 · (ω^2)^i,
+//! ```
+//!
+//! which lands on `c^2 · ⟨ω^2⟩` — itself a clean coset of the squared
+//! subgroup, of size exactly `n / 2`. No collisions, no fixed points
+//! to special-case, no wasted randomness. (On a "pure" subgroup
+//! containing `1`, squaring sends both `x` and `-x` to the same point
+//! and `1 → 1` is a fixed point; the elegant translate-of-subgroup
+//! recursion FRI depends on breaks down.) The offset `c` is what
+//! makes the recursion uniform across rounds — an elegant algebraic
+//! trick, not a hack.
+//!
+//! ### What FRI / STARK soundness rests on
+//!
+//! Soundness of FRI and STARKs does **not** depend on the evaluation
+//! domain being a group. It rests on:
+//!
+//! - The **polynomial root bound / Schwartz-Zippel lemma** — random
+//!   challenges hit roots of low-degree error polynomials with
+//!   probability `≤ d / |F|`.
+//! - **Low-degree algebraic folding** — a cheating prover's freedom
+//!   in any round is bounded by the degree of the protocol's
+//!   univariate slices, not by any group axioms on the domain.
+//! - **Verifier randomness drawn from a sufficiently large `F`**.
+//!
+//! The coset offset `c` is a public constant (or derived from a public
+//! random seed). It adds no algebraic structure an attacker could
+//! exploit; what it buys is a clean disjointness between the
+//! evaluation domain and the smaller **trace domain** the codeword is
+//! interpolating from.
 //!
 //! ## Why STARKs use cosets
 //!
@@ -130,6 +236,26 @@
 //!   Simple; fine for first-pass FRI-style code.
 //! - [`EvaluationDomain::new_coset`] → `L = c · ⟨ω⟩`, shifted away from `1`.
 //!   What STIR and production STARKs use.
+//!
+//! ## Smoothness, formally
+//!
+//! A finite multiplicative subgroup `H ⊆ F_p^*` is called **smooth** (of
+//! 2-power order) when `|H| = 2^k` for some integer `k`. Equivalently, the
+//! order of every element of `H` divides `2^k`. Goldilocks's
+//! `p - 1 = 2^32 · (2^32 - 1)` has **2-adicity 32**, so `F_p^*` contains a
+//! smooth subgroup of order `2^k` for every `0 ≤ k ≤ 32` — and none larger.
+//!
+//! Smoothness is the property that makes the Cooley-Tukey radix-2 FFT and
+//! FRI's halving-step folding work. The recursion halves `|H|` at each
+//! step by passing to `⟨ω²⟩ ⊂ ⟨ω⟩`, which has order `|H| / 2` (Lemma A in
+//! `fft.rs`). For this to land cleanly on `|H| = 1` after `k` halvings,
+//! `|H| = 2^k` is **necessary** — a domain of size `12` would jam at size 3.
+//!
+//! Smoothness has nothing to do with the algebraic structure of `F_p` as a
+//! whole; only the existence of large 2-power-sized subgroups matters.
+//! A field can be "FFT-friendly" purely because `p - 1` has a high
+//! 2-adicity, independent of `p`'s size — see the field-comparison table
+//! in `field.rs` for BabyBear vs Goldilocks vs BLS12-381 trade-offs.
 //!
 //! The FFT (`fft::fft_on_domain`) handles both via the "pre-scale
 //! coefficients by powers of `c`" trick: a coset-FFT of `p` on `c · ⟨ω⟩`
@@ -232,6 +358,14 @@ impl EvaluationDomain {
     /// element(4) → wraps to element(0) = 1
     /// ```
     pub fn element(&self, i: usize) -> Fp {
+        // TODO: return the `i`-th element of `L = c·⟨ω⟩`.
+        //   1. Reduce `i mod n` — the domain wraps cyclically (`ω^n = 1`).
+        //   2. Return `offset * generator.pow(i)`, i.e. `c · ω^i`.
+        // See the worked example just above (and "What is a coset?" in module
+        // docs) for why this is exactly the i-th element of `cH`.
+        //
+        // Reference implementation below.
+
         // Reduce i mod n first. Two reasons:
         //
         //   1. Implements the wraparound contract above (element(n) == element(0)).

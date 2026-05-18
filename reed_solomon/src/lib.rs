@@ -84,3 +84,10 @@ pub mod fft;
 pub mod field;
 pub mod interpolate;
 pub mod polynomial;
+
+// Crate-root re-exports of the load-bearing types so downstream crates
+// (e.g. `stir`) can write `reed_solomon::Fp` instead of
+// `reed_solomon::field::Fp`. Sub-module paths still work.
+pub use domain::EvaluationDomain;
+pub use field::Fp;
+pub use polynomial::UnivariatePoly;

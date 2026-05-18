@@ -15,7 +15,7 @@ on the primitives implemented in earlier ones.
 | #  | Crate                                  | Topic                                                          | Status        |
 |----|----------------------------------------|----------------------------------------------------------------|---------------|
 | 1  | [`sumcheck/`](./sumcheck/)             | Multilinear sumcheck (Lund-Fortnow-Karloff-Nisan 1992)         | complete      |
-| 2  | [`reed_solomon/`](./reed_solomon/)     | Goldilocks field, NTT, RS encoder/decoder                      | in progress   |
+| 2  | [`reed_solomon/`](./reed_solomon/)     | Goldilocks field, NTT, RS encoder/decoder (with Berlekamp-Welch) | complete      |
 | 3  | `stir/`                                | STIR low-degree test (eprint 2024/390)                         | pending       |
 | 4  | `whir/`                                | Multilinear extension of STIR (eprint 2024/1586)               | pending       |
 | 5  | `stark/`                               | AIR + pluggable low-degree-test STARK                          | pending       |

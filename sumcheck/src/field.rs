@@ -85,9 +85,40 @@ impl Fp {
         result
     }
 
-    /// Multiplicative inverse via Fermat's little theorem: `self^(p-2)` for `p` prime.
+    /// Multiplicative inverse via Fermat's little theorem.
     ///
-    /// Returns `None` if `self == zero()`.
+    /// Returns `None` if `self == zero()` — zero has no inverse in any field.
+    ///
+    /// # Why `self.pow(MODULUS - 2)` is the inverse
+    ///
+    /// **Fermat's little theorem.** For a prime `p` and any nonzero
+    /// `a ∈ F_p`,
+    ///
+    /// ```text
+    /// a^(p-1) ≡ 1  (mod p).
+    /// ```
+    ///
+    /// **One algebra step.** Split off a factor of `a` on the left:
+    ///
+    /// ```text
+    /// a^(p-1)  =  a · a^(p-2)  ≡  1  (mod p).
+    /// ```
+    ///
+    /// "Multiplying `a` by `a^(p-2)` yields the multiplicative identity"
+    /// *is* the definition of "`a^(p-2)` is the multiplicative inverse of
+    /// `a` mod `p`". So **the inverse of `a` is `a^(p-2)`**, computed by
+    /// the same square-and-multiply [`Fp::pow`] used for any exponentiation.
+    /// No extended-Euclidean-algorithm gymnastics needed; the prime modulus
+    /// hands us the inverse for free, packaged as an exponentiation.
+    ///
+    /// # Why zero returns `None`
+    ///
+    /// Fermat's hypothesis requires `a ≠ 0`. Zero is excluded structurally:
+    /// `0 · x = 0` for every `x ∈ F`, so no `x` satisfies `0 · x = 1` — the
+    /// inverse genuinely does not exist. We return `None` rather than panic
+    /// because callers may legitimately produce zero (e.g., a sum that
+    /// happens to cancel, or a Lagrange-denominator collision the caller
+    /// wants to detect) and prefer an `Option` over an `unwrap()`.
     pub fn inverse(self) -> Option<Self> {
         // TODO: special-case zero, then return Some(self.pow(MODULUS - 2)).
         if self == Self::zero() {
@@ -98,9 +129,121 @@ impl Fp {
     }
 }
 
+/// Per-thread counters for `Fp` arithmetic operations.
+///
+/// Every call to `Fp`'s `+`, `-`, `*`, or `Neg` increments the matching
+/// per-thread counter. Snapshot via [`op_counter::snapshot`] before and
+/// after a region of code, then call [`OpCounts::since`] on the later
+/// snapshot to get the ops performed in that region. Used by `bin/demo.rs`
+/// to **measure** the prover/verifier's work rather than predict it from
+/// formulas.
+///
+/// Thread-local (not atomic), so parallel tests don't interfere across
+/// threads. The increment is a `Cell::set` — no atomic operations and no
+/// allocation — so the overhead per `Fp` op is a couple of nanoseconds.
+///
+/// # Example
+///
+/// ```ignore
+/// use sumcheck::field::{op_counter, Fp};
+///
+/// let before = op_counter::snapshot();
+/// let _ = Fp::new(3) + Fp::new(4);
+/// let _ = Fp::new(5) * Fp::new(6);
+/// let delta = op_counter::snapshot().since(&before);
+/// assert_eq!(delta.adds, 1);
+/// assert_eq!(delta.muls, 1);
+/// assert_eq!(delta.total(), 2);
+/// ```
+pub mod op_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ADDS: Cell<u64> = const { Cell::new(0) };
+        static SUBS: Cell<u64> = const { Cell::new(0) };
+        static MULS: Cell<u64> = const { Cell::new(0) };
+        static NEGS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// A snapshot of the per-thread `Fp` op counters at one moment.
+    ///
+    /// Subtract an earlier snapshot via [`OpCounts::since`] to get the
+    /// op count between the two snapshots.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct OpCounts {
+        /// Number of `Fp + Fp` operations counted.
+        pub adds: u64,
+        /// Number of `Fp - Fp` operations counted.
+        pub subs: u64,
+        /// Number of `Fp * Fp` operations counted.
+        pub muls: u64,
+        /// Number of `-Fp` (unary negation) operations counted.
+        pub negs: u64,
+    }
+
+    impl OpCounts {
+        /// Ops performed since an earlier snapshot.
+        pub fn since(&self, earlier: &Self) -> Self {
+            Self {
+                adds: self.adds - earlier.adds,
+                subs: self.subs - earlier.subs,
+                muls: self.muls - earlier.muls,
+                negs: self.negs - earlier.negs,
+            }
+        }
+
+        /// Sum across all op categories (`adds + subs + muls + negs`).
+        pub fn total(&self) -> u64 {
+            self.adds + self.subs + self.muls + self.negs
+        }
+    }
+
+    /// Snapshot the current thread's `Fp` op counters.
+    pub fn snapshot() -> OpCounts {
+        OpCounts {
+            adds: ADDS.with(|c| c.get()),
+            subs: SUBS.with(|c| c.get()),
+            muls: MULS.with(|c| c.get()),
+            negs: NEGS.with(|c| c.get()),
+        }
+    }
+
+    /// Reset all of this thread's counters to zero. Useful for isolating
+    /// a region of code from earlier accumulated activity, though
+    /// [`snapshot`] + [`OpCounts::since`] is usually preferable.
+    pub fn reset() {
+        ADDS.with(|c| c.set(0));
+        SUBS.with(|c| c.set(0));
+        MULS.with(|c| c.set(0));
+        NEGS.with(|c| c.set(0));
+    }
+
+    // --------- Internal increment helpers, called by Fp impls. ---------
+
+    #[inline]
+    pub(super) fn bump_add() {
+        ADDS.with(|c| c.set(c.get() + 1));
+    }
+    #[inline]
+    pub(super) fn bump_sub() {
+        SUBS.with(|c| c.set(c.get() + 1));
+    }
+    #[inline]
+    pub(super) fn bump_mul() {
+        MULS.with(|c| c.set(c.get() + 1));
+    }
+    #[inline]
+    pub(super) fn bump_neg() {
+        NEGS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 // ============================================================================
 // Arithmetic operator impls. You must implement all of these. Use `u128` as
 // an intermediate to avoid overflow during multiplication.
+//
+// Every primitive op below calls `op_counter::bump_*` so `bin/demo.rs` can
+// measure the actual operation count for any region of code.
 // ============================================================================
 
 impl Add for Fp {
@@ -109,6 +252,7 @@ impl Add for Fp {
     fn add(self, rhs: Fp) -> Fp {
         // TODO: addition mod MODULUS. Hint: u64 sum can overflow if both are
         // close to MODULUS, but using u128 intermediate avoids that.
+        op_counter::bump_add();
         let sum = (self.0 as u128) + (rhs.0 as u128);
         Fp::new((sum % MODULUS as u128) as u64)
     }
@@ -128,6 +272,7 @@ impl Sub for Fp {
         // TODO: subtraction mod MODULUS.
         // Hint: equivalent to self + (-rhs), but you can also do
         //   if self.0 >= rhs.0 { self.0 - rhs.0 } else { self.0 + MODULUS - rhs.0 }
+        op_counter::bump_sub();
         if self.0 >= rhs.0 {
             Fp::new(self.0 - rhs.0)
         } else {
@@ -149,6 +294,7 @@ impl Mul for Fp {
     fn mul(self, rhs: Fp) -> Fp {
         // TODO: multiplication mod MODULUS.
         // Hint: cast both to u128, multiply, then take mod and cast back.
+        op_counter::bump_mul();
         let product = (self.0 as u128) * (rhs.0 as u128);
         Fp::new((product % MODULUS as u128) as u64)
     }
@@ -166,6 +312,7 @@ impl Neg for Fp {
 
     fn neg(self) -> Fp {
         // TODO: -x mod MODULUS. Special-case x == 0.
+        op_counter::bump_neg();
         if self == Self::zero() {
             Self::zero()
         } else {

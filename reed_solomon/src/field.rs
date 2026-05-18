@@ -116,6 +116,42 @@
 //! mod p`); we use the simple `u128` reduction for clarity. The asymptotics
 //! are the same.
 //!
+//! ### How does Goldilocks compare to other production fields?
+//!
+//! "FFT-friendly" is a spectrum, not a yes/no — different systems pick
+//! different points on the trade-off curve between **2-adicity** (max
+//! FFT size) and **bit width** (cost per field op). A few production
+//! choices for context:
+//!
+//! ```text
+//! Field           | bit width  | 2-adicity | Max FFT size | Used by
+//! ----------------|------------|-----------|--------------|---------------------------
+//! BabyBear        | 31-bit     |     27    |     2^27     | Plonky3 (small RISC zkVMs)
+//! Mersenne 31     | 31-bit     |      1    |      2       | sumcheck only (this crate)
+//! Goldilocks      | 64-bit     |     32    |     2^32     | Plonky2, ethSTARK, this crate
+//! BN254 scalar    | 254-bit    |     28    |     2^28     | Groth16, PLONK (KZG-based)
+//! BLS12-381 scalar| 255-bit    |     32    |     2^32     | Filecoin, Zcash Sapling
+//! ```
+//!
+//! Two trade-offs to notice:
+//!
+//! - **Smaller fields are cheaper per operation.** BabyBear's 31-bit
+//!   arithmetic fits in a single `u32` register (a single 64-bit multiply
+//!   produces the product with no overflow handling). Goldilocks needs
+//!   `u128` intermediates for `Mul`. Pairing-friendly fields like
+//!   BN254/BLS12-381 are 4× wider, so each multiply is ~16× more expensive
+//!   than Goldilocks. Smaller is faster *per op*.
+//! - **Larger 2-adicity = bigger problems.** BabyBear caps at FFTs of
+//!   size `2^27 ≈ 130M`, plenty for small workloads but tight for very
+//!   large STARK traces. Goldilocks's `2^32` headroom is overkill for
+//!   most applications, which is part of why it's the production default.
+//!
+//! Goldilocks sits on the **64-bit / `2^32`** point — wide enough to fit
+//! every realistic FFT size, narrow enough that a single multiply is
+//! one `u128` op. For our curriculum it's "just right" both for the
+//! math (2-adicity of 32 is plenty) and for the implementation (one
+//! `u128` intermediate, no SIMD/FMA tricks needed).
+//!
 //! ## Invariant
 //!
 //! Every `Fp` value is canonical: stored as a `u64` strictly less than
@@ -130,8 +166,7 @@
 //! - `omega^2 = g^((p-1)/2) = -1` — the unique element of order exactly 2,
 //!   which in `F_p` is `p - 1 ≡ -1 mod p`.
 //!
-//! Both are unit tests below. The general argument — why this construction
-//! works for every `log_n ∈ [0, 32]` — is the next section.
+//! Both are unit tests below.
 //!
 //! ## Why `g^((p-1)/2^k)` is a *primitive* `2^k`-th root of unity
 //!
@@ -234,15 +269,14 @@ impl Fp {
     ///
     /// Standard square-and-multiply.
     pub fn pow(self, mut exp: u64) -> Self {
-        // TODO: same algorithm as the sumcheck Fp::pow you wrote.
-        // Pseudocode:
-        //   result = Fp::one()
-        //   base = self
-        //   while exp > 0:
-        //     if exp is odd: result = result * base
-        //     base = base * base
-        //     exp = exp >> 1
-        //   return result
+        // TODO: compute `self^exp` in O(log exp) field multiplications.
+        //   1. Walk each bit of `exp` from low to high (square-and-multiply).
+        //   2. When the current bit is 1, fold `base` into `result` (`result *= base`).
+        //   3. Square `base` each iteration so `base = self^(2^i)` tracks the bit position.
+        // See the "Worked example: a primitive 4th root of unity" section above —
+        // `g.pow((p-1)/4)` is one place this routine gets hammered.
+        //
+        // Reference implementation below.
         let mut result = Self::one();
         let mut base = self;
 
@@ -276,7 +310,6 @@ impl Fp {
     /// `g = MULTIPLICATIVE_GENERATOR`. Fermat's little theorem gives
     /// `omega^(2^log_n) = g^(p-1) = 1` (so `omega` is a root); the fact
     /// that `g` has order *exactly* `p - 1` rules out any smaller order.
-    /// See the module docs for the precise argument.
     ///
     /// Panics if `log_n > TWO_ADICITY` (no such root exists in this field).
     ///
@@ -286,13 +319,14 @@ impl Fp {
     /// - `log_n = 1` → `omega = -1 = MODULUS - 1` (primitive 2nd root).
     /// - `log_n = 2` → some `omega` with `omega^4 = 1` and `omega^2 = -1`.
     pub fn primitive_root_of_unity(log_n: u32) -> Self {
-        // TODO:
-        //   1. Assert log_n <= TWO_ADICITY with a clear message.
-        //   2. Compute the exponent: (MODULUS - 1) >> log_n.
-        //      This works because (MODULUS - 1) = 0xFFFFFFFF00000000 has its
-        //      low 32 bits all zero — so for any log_n <= 32, the right-shift
-        //      gives an exact division.
-        //   3. Return Fp::new(MULTIPLICATIVE_GENERATOR).pow(exponent).
+        // TODO: produce an element of order exactly `2^log_n` in F_p.
+        //   1. Assert `log_n <= TWO_ADICITY` (otherwise no such element exists).
+        //   2. Compute `exponent = (p - 1) >> log_n` — an exact division because
+        //      `2^log_n | p - 1` by the field's 2-adicity.
+        //   3. Return `g.pow(exponent)` for `g = MULTIPLICATIVE_GENERATOR`.
+        // See "Why `g^((p-1)/2^k)` is a *primitive* `2^k`-th root of unity" above.
+        //
+        // Reference implementation below.
         assert!(log_n <= TWO_ADICITY, "log_n must be <= TWO_ADICITY");
         let exponent = (MODULUS - 1) >> log_n;
         Self::new(MULTIPLICATIVE_GENERATOR).pow(exponent)

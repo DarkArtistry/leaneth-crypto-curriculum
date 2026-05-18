@@ -1,0 +1,23 @@
+[package]
+name = "stir"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Educational implementation of the STIR low-degree IOP of proximity (eprint 2024/390) over Goldilocks"
+
+[dependencies]
+reed_solomon = { path = "../reed_solomon" }
+rand = "0.8"
+blake3 = "1.5"
+sha3 = "0.10"
+
+[dev-dependencies]
+proptest = "1.4"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"

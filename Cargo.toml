@@ -3,10 +3,10 @@ resolver = "2"
 members = [
     "sumcheck",
     "reed_solomon",
+    "stir",
 ]
 
 # Future objectives will be added here as you complete them:
-# "stir",
 # "whir",
 # "stark",
 # "stark_whir",

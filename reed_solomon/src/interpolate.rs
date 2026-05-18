@@ -81,33 +81,52 @@ use crate::polynomial::UnivariatePoly;
 ///
 /// Panics if the input is empty or contains a duplicate `x` coordinate.
 pub fn lagrange_interpolate(points: &[(Fp, Fp)]) -> UnivariatePoly {
-    // TODO:
-    //   1. Assert points.is_empty() == false.
-    //   2. (Optional, but recommended.) Sanity-check that all x's are distinct.
-    //      Since duplicates would otherwise produce a divide-by-zero in step 4,
-    //      catching them early is friendlier. O(n^2) check is fine for our sizes.
-    //   3. Build the result by accumulating term by term:
-    //        result = UnivariatePoly::zero();
-    //        for i in 0..n:
-    //            // Numerator: prod_{j != i} (X - x_j)
-    //            // Start with the constant polynomial 1, and multiply in (X - x_j) for each j != i.
-    //            // The polynomial (X - x_j) is UnivariatePoly::new(vec![-x_j, Fp::one()]).
-    //            let mut numerator = UnivariatePoly::one();
-    //            let mut denominator = Fp::one();
-    //            for j in 0..n if j != i:
-    //                let (xj, _) = points[j];
-    //                numerator = numerator * UnivariatePoly::new(vec![-xj, Fp::one()]);
-    //                denominator = denominator * (points[i].0 - xj);
-    //            // L_i(X) = numerator * (denominator^-1)
-    //            let denom_inv = denominator.inverse().expect("distinct x_i implies non-zero denominator");
-    //            let scaled_numerator = scalar_mul(&numerator, points[i].1 * denom_inv);
-    //            result = result + scaled_numerator;
-    //        result
+    // TODO: build the unique degree-`< n` polynomial through all points.
+    //   1. For each i, build the i-th Lagrange basis poly `L_i(X)`:
+    //      numerator `∏_{j≠i} (X - x_j)` divided by scalar `∏_{j≠i} (x_i - x_j)`.
+    //      `L_i(x_i) = 1` and `L_i(x_k) = 0` for k ≠ i by construction.
+    //   2. Accumulate `result += y_i · L_i(X)` so `result(x_i) = y_i` for every i.
+    // See the worked example with `(1,1), (2,4), (3,9) → X²` in the module docs.
     //
-    // Helper `scalar_mul(poly, scalar)`: multiply every coefficient by scalar.
-    // You can write this as a free function in this module, or inline the loop.
-    let _ = points;
-    todo!()
+    // Reference implementation below.
+    assert!(!points.is_empty(), "points must not be empty");
+
+    // Distinctness check on x coordinates. O(n²) but n is small for our use.
+    let n = points.len();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            assert_ne!(
+                points[i].0, points[j].0,
+                "duplicate x coordinate at indices {} and {}",
+                i, j
+            );
+        }
+    }
+
+    let mut result = UnivariatePoly::zero();
+    for i in 0..n {
+        let mut numerator = UnivariatePoly::one(); // polynomial accumulator, starts at 1
+        let mut denominator = Fp::one(); // scalar accumulator, starts at 1
+
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let xj = points[j].0;
+            
+            numerator = numerator * UnivariatePoly::new(vec![-xj, Fp::one()]);
+            denominator = denominator * (points[i].0 - xj);
+        }
+
+
+        let denom_inv = denominator
+            .inverse()
+            .expect("distinct x_i implies non-zero denominator");
+
+        let scaled = scalar_mul(&numerator, points[i].1 * denom_inv);
+        result = result + scaled;
+    }
+    result
 }
 
 /// Multiply every coefficient of `poly` by `scalar`. Returns a new polynomial.
@@ -118,8 +137,13 @@ pub fn scalar_mul(poly: &UnivariatePoly, scalar: Fp) -> UnivariatePoly {
     // TODO: map each coefficient through `* scalar`, then wrap with
     // UnivariatePoly::new (which strips trailing zeros — important when
     // scalar == zero!).
-    let _ = (poly, scalar);
-    todo!()
+
+    // new: `lagrange_interpolate` calls this, so it needs a real body.
+    // Wrap with `UnivariatePoly::new` (not `from_coeffs_unstripped`) so that
+    // `scalar = Fp::zero()` correctly canonicalises to the zero polynomial
+    // instead of "a polynomial with n trailing zeros".
+    let scaled: Vec<Fp> = poly.coeffs().iter().map(|&c| c * scalar).collect();
+    UnivariatePoly::new(scaled)
 }
 
 // ============================================================================
@@ -128,27 +152,29 @@ pub fn scalar_mul(poly: &UnivariatePoly, scalar: Fp) -> UnivariatePoly {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
     use super::*;
 
     #[test]
     fn interpolate_constant() {
         // TODO: one point (5, 7). The interpolating polynomial is the constant 7.
         // Assert poly == UnivariatePoly::new(vec![Fp::new(7)]).
-        todo!()
+        assert_eq!(lagrange_interpolate(&[(Fp::new(5), Fp::new(7))]), UnivariatePoly::new(vec![Fp::new(7)]));
     }
 
     #[test]
     fn interpolate_linear() {
         // TODO: two points (0, 1) and (1, 3). The interpolating polynomial is
         // p(X) = 1 + 2X.
-        todo!()
+        assert_eq!(lagrange_interpolate(&[(Fp::new(0), Fp::new(1)), (Fp::new(1), Fp::new(3))]), UnivariatePoly::new(vec![Fp::new(1), Fp::new(2)]));
     }
 
     #[test]
     fn interpolate_x_squared() {
         // TODO: three points (1, 1), (2, 4), (3, 9). Result must be X^2,
         // i.e., UnivariatePoly::new(vec![Fp::zero(), Fp::zero(), Fp::one()]).
-        todo!()
+        assert_eq!(lagrange_interpolate(&[(Fp::new(1), Fp::new(1)), (Fp::new(2), Fp::new(4)), (Fp::new(3), Fp::new(9))]), UnivariatePoly::new(vec![Fp::zero(), Fp::zero(), Fp::one()]));
     }
 
     #[test]
@@ -159,7 +185,30 @@ mod tests {
         //   3. Compute y_i = p.evaluate(x_i).
         //   4. lagrange_interpolate(&points) should equal p.
         // Use a seeded RNG.
-        todo!()
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        // 1. Random degree-5 polynomial (6 coefficients).
+        let mut rng = StdRng::seed_from_u64(42);
+        let coefficients: Vec<Fp> = (0..6).map(|_| Fp::random(&mut rng)).collect();
+        let p = UnivariatePoly::new(coefficients);
+
+        // 2. Pick 6 distinct x's: x_i = 1, 2, 3, 4, 5, 6.
+        // 3. Compute y_i = p(x_i) by EVALUATING the polynomial — this is the
+        //    step that connects the points to the polynomial. (The original
+        //    bug was pairing x_i with a coefficient, which had no relation
+        //    to p's value at x_i.)
+        let points: Vec<(Fp, Fp)> = (1..=6u64)
+            .map(|i| {
+                let x = Fp::new(i);
+                (x, p.evaluate(x))
+            })
+            .collect();
+
+        // 4. Interpolating those (x_i, p(x_i)) pairs must recover p exactly,
+        //    since p is the unique polynomial of degree < 6 passing through
+        //    6 distinct points (Polynomial Interpolation Theorem).
+        assert_eq!(lagrange_interpolate(&points), p);
     }
 
     #[test]
@@ -174,6 +223,6 @@ mod tests {
         // TODO: scalar_mul of any poly by Fp::zero() returns the zero polynomial.
         // (This is why scalar_mul has to call UnivariatePoly::new rather than
         // from_coeffs_unstripped — to canonicalize.)
-        todo!()
+        scalar_mul(&UnivariatePoly::new(vec![Fp::new(1), Fp::new(2)]), Fp::zero());
     }
 }

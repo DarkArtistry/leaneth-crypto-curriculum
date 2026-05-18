@@ -1,470 +1,551 @@
-//! Multilinear polynomials in evaluation form over the boolean hypercube `{0,1}^v`.
+//! Multivariate polynomials in evaluation form on a product domain `S^n`.
 //!
-//! ## What is a multilinear polynomial?
+//! A [`MultivariatePoly<D>`] is `n` variables stored as `|S|^n` field
+//! evaluations on the grid `S^n`, where `S` is a [`SumDomain`] (see
+//! [`crate::domain`]). The Boolean hypercube (`S = {0, 1}`) is just one
+//! particular `D`; the storage layout, the "fix one variable" operation,
+//! and `evaluate` all generalise to any finite `S ⊆ F`.
 //!
-//! A polynomial `p(X_1, ..., X_n)` over a field `F` is **multilinear** if every
-//! variable appears with degree at most 1. No `x_1^2`, no `x_3^7`, just monomials
-//! that mention each variable zero or one times.
+//! ## What is "evaluation form on a product domain"?
 //!
-//! Example for n = 2:
+//! Let `g: F^n -> F` be a multivariate polynomial whose per-variable degree
+//! is strictly less than `k = |S|`. By the
+//! **multivariate Lagrange-interpolation theorem** — a degree-`< k`-per-variable
+//! polynomial in `n` variables is uniquely determined by its values at any
+//! grid `T_1 × ... × T_n` of pairwise-distinct points with `|T_i| = k` — `g`
+//! is uniquely pinned down by the `k^n` numbers `g(s_1, ..., s_n)` for
+//! `(s_1, ..., s_n) ∈ S^n`. Storing those `k^n` numbers *is* the polynomial,
+//! in **evaluation form on `S^n`**.
 //!
-//! ```text
-//! p(x_1, x_2) = a + b·x_1 + c·x_2 + d·x_1·x_2
-//! ```
+//! When `S = {0, 1}` and `k = 2`, the constraint "degree `< k` per variable"
+//! is just "**multilinear**" (per-variable degree `≤ 1`), so this generalises
+//! the classical Multilinear Extension (MLE) story to general `S`.
 //!
-//! Total degree can be up to n, but **per-variable degree exactly 1** is what
-//! makes it well-behaved for interactive-proof protocols (each variable, viewed
-//! alone, is a straight line — see Step C of "Why evaluation form?" below).
+//! ## Why the MLE (and its `k > 2` generalisation) is unique
 //!
-//! ## What is the Multilinear Extension (MLE)?
+//! Claim: among all polynomials `p(x_1, ..., x_n) ∈ F[x_1, ..., x_n]` with
+//! **per-variable degree `< k`**, the one agreeing with a target function
+//! `f: S^n -> F` on all `k^n` points of `S^n` is **unique**.
 //!
-//! Let `f : {0,1}^n → F` be any function — think of it as a lookup table of
-//! `2^n` field values, one per boolean tuple.
+//! Proof (constructive, by dimension count + injectivity).
 //!
-//! The **Multilinear Extension** of f, written `f~`, is the unique multilinear
-//! polynomial over `F^n` that agrees with f on the boolean hypercube:
+//! - The space `V` of polynomials with per-variable degree `< k` in each of
+//!   `n` variables has the monomial basis
+//!   `{ x_1^{i_1} · x_2^{i_2} · ... · x_n^{i_n} : 0 ≤ i_v < k }`, hence
+//!   `dim V = k^n`.
+//! - The evaluation map `ev: V -> F^{S^n}` sending `p` to
+//!   `(p(s))_{s ∈ S^n}` is linear, between two `k^n`-dimensional spaces.
+//! - **`ev` is injective.** By induction on `n`. Base `n = 1`: a nonzero
+//!   univariate `p` of degree `< k` has at most `k - 1` roots (factor
+//!   theorem: if a polynomial `p(X) ∈ F[X]` has `p(α) = 0`, then
+//!   `p(X) = (X - α) · q(X)` for some `q ∈ F[X]` of degree `deg p - 1`), so
+//!   it can't vanish on all `k` points of `S`. Inductive step `n -> n + 1`: write
+//!   `p(x_1, ..., x_{n+1}) = sum_{i = 0}^{k - 1} p_i(x_2, ..., x_{n+1}) · x_1^i`.
+//!   If `p` vanishes on `S^{n+1}` then for every `rest ∈ S^n` the univariate
+//!   `x_1 -> p(x_1, rest)` vanishes on `S`, so by the base case it's
+//!   identically zero, so each `p_i(rest) = 0`. That means every `p_i`
+//!   vanishes on `S^n`, so by induction every `p_i = 0`, so `p = 0`. ∎
+//! - A linear map between equal-dimensional spaces that is injective is a
+//!   **bijection**. So for every target function `f: S^n -> F` there is
+//!   exactly one `p ∈ V` with `ev(p) = f`. That `p` is what we store as `evals`.
 //!
-//! ```text
-//! f~(b) = f(b)    for every b in {0,1}^n
-//! ```
+//! ## Worked numeric example with `|D| = 3`, `n = 2`
 //!
-//! The explicit formula is Lagrange interpolation specialized to the cube:
-//!
-//! ```text
-//! f~(x) = sum over b in {0,1}^n of  f(b) · prod_i (b_i·x_i + (1 - b_i)·(1 - x_i))
-//! ```
-//!
-//! The factor `prod_i (b_i·x_i + (1 - b_i)·(1 - x_i))` is the multilinear basis
-//! polynomial `chi_b(x)` — it equals 1 at `b` and 0 at every other boolean point.
-//! This is exactly the formula `evaluate` implements.
-//!
-//! **Uniqueness:** any two multilinear polynomials agreeing on all `2^n` boolean
-//! points are identical. Their difference would be a multilinear polynomial that
-//! vanishes on the entire hypercube — which forces all coefficients to zero.
-//!
-//! ## Why MLEs show up everywhere in cryptography
-//!
-//! The **sum-check protocol** (Lund-Fortnow-Karloff-Nisan, 1990) lets a prover
-//! convince a verifier that
-//!
-//! ```text
-//! sum over x in {0,1}^n of g(x) = C
-//! ```
-//!
-//! for a low-degree multivariate polynomial `g`, using only `O(n)` rounds. Most
-//! statements we actually care about — circuit satisfaction, matrix multiplication,
-//! R1CS, lookups — are naturally sums (or products) over the boolean hypercube.
-//! By replacing the boolean function with its MLE `f~`, the statement becomes
-//! a low-degree polynomial identity that sum-check can verify.
-//!
-//! This is why MLE-centric designs include:
-//!
-//! - **GKR** (circuit verification)
-//! - **Spartan**, **HyperPlonk**, **Jolt** (modern multilinear SNARKs)
-//! - many polynomial IOPs and SNARKs more broadly
-//!
-//! The "extension" step is what lets algebraic tools (Schwartz-Zippel, sum-check)
-//! talk to combinatorial objects defined on the boolean cube.
-//!
-//! ## Storage convention
-//!
-//! Stored as a `Vec<Fp>` of length `2^v`. **Read each index as binary, with
-//! `x_1` as the least significant bit.**
-//!
-//! Quick example: `evals[5]` for `v = 3`:
+//! Take `D = Interval3` (so `S = {0, 1, 2}`, `k = 3`) and the polynomial
 //!
 //! ```text
-//!     5 = 1 0 1  (binary)
-//!         |  |  |
-//!         x_3 x_2 x_1     →   evals[5] = f(1, 0, 1)
+//! g(x_1, x_2) = x_1 + x_2.
 //! ```
 //!
-//! For `v = 2`, the order is:
-//! - `evals[0] = f(0, 0)`         (i = 00, x_1 = 0, x_2 = 0)
-//! - `evals[1] = f(1, 0)`         (i = 01, x_1 = 1, x_2 = 0)
-//! - `evals[2] = f(0, 1)`         (i = 10, x_1 = 0, x_2 = 1)
-//! - `evals[3] = f(1, 1)`         (i = 11, x_1 = 1, x_2 = 1)
-//!
-//! For `v = 3`, the order is:
-//! - `evals[0] = f(0, 0, 0)`      (i = 000)
-//! - `evals[1] = f(1, 0, 0)`      (i = 001)
-//! - `evals[2] = f(0, 1, 0)`      (i = 010)
-//! - `evals[3] = f(1, 1, 0)`      (i = 011)
-//! - `evals[4] = f(0, 0, 1)`      (i = 100)
-//! - `evals[5] = f(1, 0, 1)`      (i = 101)
-//! - `evals[6] = f(0, 1, 1)`      (i = 110)
-//! - `evals[7] = f(1, 1, 1)`      (i = 111)
-//!
-//! This LSB-first convention matches Plonky3 and is consistent with how
-//! `fix_first_variable` reduces adjacent pairs of evaluations.
-//!
-//! ## Why evaluation form? — worked example with a real polynomial
-//!
-//! Take this specific multilinear polynomial:
+//! Per-variable degree of `g` is `1 < k`, so storing `g` as its `3^2 = 9`
+//! evaluations on `S^2` is faithful — no information loss. The evaluations:
 //!
 //! ```text
-//! f(x_1, x_2, x_3) = 1 + 2·x_1 + 3·x_2 + 4·x_3
+//! g(0, 0) = 0    g(1, 0) = 1    g(2, 0) = 2
+//! g(0, 1) = 1    g(1, 1) = 2    g(2, 1) = 3
+//! g(0, 2) = 2    g(1, 2) = 3    g(2, 2) = 4
 //! ```
 //!
-//! ### Step A — Where does `evals` come from?
-//!
-//! Plug each of the 8 boolean corners into `f`:
+//! Laid out in **mixed-radix LSB-first** order with `x_1` least significant:
 //!
 //! ```text
-//! f(0, 0, 0) = 1 + 0 + 0 + 0 = 1
-//! f(1, 0, 0) = 1 + 2 + 0 + 0 = 3
-//! f(0, 1, 0) = 1 + 0 + 3 + 0 = 4
-//! f(1, 1, 0) = 1 + 2 + 3 + 0 = 6
-//! f(0, 0, 1) = 1 + 0 + 0 + 4 = 5
-//! f(1, 0, 1) = 1 + 2 + 0 + 4 = 7
-//! f(0, 1, 1) = 1 + 0 + 3 + 4 = 8
-//! f(1, 1, 1) = 1 + 2 + 3 + 4 = 10
+//! evals = [0, 1, 2,   1, 2, 3,   2, 3, 4]
+//!          ^^^^^^^^   ^^^^^^^^   ^^^^^^^^
+//!          x_2 = 0    x_2 = 1    x_2 = 2
 //! ```
 //!
-//! Lay them out in LSB-first order — index `i` interpreted as binary with
-//! `x_1` being the LSB:
+//! - [`sum_over_domain`](MultivariatePoly::sum_over_domain) returns
+//!   `0+1+2+1+2+3+2+3+4 = 18`, simply by adding the nine stored values.
+//! - [`evaluate(&[7, 0])`](MultivariatePoly::evaluate) returns `Fp(7)`, since
+//!   `g(7, 0) = 7 + 0`. The implementation gets there by interpolation, not
+//!   by re-evaluating the symbolic expression.
+//!
+//! ## Mixed-radix indexing primer
+//!
+//! "Mixed-radix" sounds fancy; for our case (every digit shares the same
+//! radix `k = |S|`) it's just **base-`k`, little-endian**. An index
+//! `i ∈ [0, k^n)` decomposes into `n` digits
 //!
 //! ```text
-//! evals = [1, 3, 4, 6, 5, 7, 8, 10]
-//!
-//! evals[0] = f(0,0,0) = 1     (i = 000)
-//! evals[1] = f(1,0,0) = 3     (i = 001)
-//! evals[2] = f(0,1,0) = 4     (i = 010)
-//! evals[3] = f(1,1,0) = 6     (i = 011)
-//! evals[4] = f(0,0,1) = 5     (i = 100)
-//! evals[5] = f(1,0,1) = 7     (i = 101)
-//! evals[6] = f(0,1,1) = 8     (i = 110)
-//! evals[7] = f(1,1,1) = 10    (i = 111)
+//! i = i_1 + i_2 · k + i_3 · k^2 + ... + i_n · k^{n-1},     i_j ∈ [0, k)
 //! ```
 //!
-//! That's it. **From here on, we work with `evals`, not the polynomial expression.**
+//! and `evals[i]` stores `g(elements[i_1], elements[i_2], ..., elements[i_n])`.
+//! Equivalently, digit `j` is `i_j = (i / k^{j-1}) mod k`. Variable `x_1` is
+//! the **least significant digit** — adjacent indices `(0, 1, ..., k-1)`
+//! sweep `x_1` through `S` while holding `x_2, ..., x_n` fixed. That's what
+//! makes [`fix_first_variable`](MultivariatePoly::fix_first_variable) cache-
+//! friendly: the `k` evaluations needed to interpolate along the `x_1`-axis
+//! are stored contiguously.
 //!
-//! ### Step B — Sum over the cube, two ways
+//! Two concrete specialisations:
 //!
-//! **Eval form:** add the 8 numbers in the vector.
+//! - **`k = 2` (Boolean cube).** Digits are bits, mixed-radix collapses to
+//!   ordinary LSB-first binary. `evals[5]` for `n = 3` is `g(1, 0, 1)`:
+//!   `5 = 101_2 = 1 + 0·2 + 1·4`.
+//! - **`k = 3` (Interval3).** Digits are base-3. `evals[5]` for `n = 2` is
+//!   `g(elements[2], elements[1]) = g(2, 1)`: `5 = 1·3 + 2 = "12"_3`, so
+//!   `i_1 = 2, i_2 = 1`. In the table above, `evals[5] = g(2, 1) = 3` ✓.
+//!
+//! ## Sum over the domain — `H = sum over x in S^n of g(x)`
+//!
+//! Trivially `evals.iter().sum()`, because `evals` *already* lists `g` at
+//! every point of `S^n`. The whole point of evaluation form is that this
+//! sum (the quantity sumcheck proves) is free to compute up-front: zero
+//! polynomial evaluations, just `|S|^n - 1` field additions.
+//!
+//! ## Fixing `x_1 = r` — the generalised "step C"
+//!
+//! "Fix `x_1 = r`" means: take the `n`-variable polynomial `g` and replace
+//! `x_1` with a specific field element `r`, getting an `(n-1)`-variable
+//! polynomial `g'(x_2, ..., x_n) = g(r, x_2, ..., x_n)`. Sumcheck drives
+//! itself forward one round at a time using exactly this move. **`r` is an
+//! arbitrary field element** — sumcheck's verifier picks it uniformly at
+//! random from all of `F`, not just from `S`.
+//!
+//! ### The pedagogical bridge: lines, generalised
+//!
+//! For `D = {0, 1}`, `g` is multilinear, so along the `x_1`-axis it's a
+//! **straight line**, and two known endpoints `g(0, rest), g(1, rest)`
+//! determine it. Slide along the line by parameter `r` to get
+//! `g(r, rest) = (1 - r)·g(0, rest) + r·g(1, rest)`.
+//!
+//! For general `D` with `|D| = k`, the same picture, one notch more
+//! powerful: `g` has per-variable degree `< k`, so along the `x_1`-axis it
+//! is a **degree-`< k` curve**, and `k` known points
+//! `g(elements[0], rest), ..., g(elements[k-1], rest)` determine it
+//! uniquely. The named tool is the **Lagrange interpolation theorem**:
+//!
+//! > A polynomial of degree `< k` is uniquely determined by its values
+//! > at any `k` distinct points, and that polynomial is given by the
+//! > Lagrange interpolation formula.
+//!
+//! ### The Lagrange basis polynomial
+//!
+//! Define the **Lagrange basis polynomial** `L_j(x)` for `j ∈ {0, ..., k-1}`:
 //!
 //! ```text
-//! H = 1 + 3 + 4 + 6 + 5 + 7 + 8 + 10 = 44
+//! L_j(x) = prod_{i ≠ j} (x - elements[i]) / (elements[j] - elements[i]).
 //! ```
 //!
-//! **Coefficient form:** plug all 8 corners into the expression `1 + 2x_1 + 3x_2 + 4x_3`,
-//! get back the 8 numbers, then sum. That's exactly the work in Step A. Eval form
-//! skips it because we already did it once and stored the results.
-//!
-//! ### Step C — Fix x_1 = r, two ways
-//!
-//! "Fix x_1 = r" means: take the v-variable polynomial and replace x_1 with a
-//! specific value r, getting a (v-1)-variable polynomial. This is the move that
-//! drives sumcheck forward — each round shrinks the polynomial by one variable.
-//!
-//! **r can be any field element** — not just 0 or 1. Sumcheck's verifier picks
-//! r uniformly at random from the entire field for soundness.
-//!
-//! #### Why the (1 - r)·A + r·B formula?
-//!
-//! Multilinear means **the polynomial is a straight line along each axis**.
-//! Pick any "rest" — say (x_2, x_3) = (0, 0). Then `f(x_1, 0, 0) = 1 + 2·x_1`
-//! is just a line in x_1, passing through two known points:
+//! By construction, `L_j` has degree `k - 1` and satisfies
+//! `L_j(elements[j]) = 1` and `L_j(elements[i]) = 0` for `i ≠ j`. The
+//! Lagrange interpolant of any function on `S` is then the sum
 //!
 //! ```text
-//! at x_1 = 0:  f(0, 0, 0) = 1     (this is evals[0])
-//! at x_1 = 1:  f(1, 0, 0) = 3     (this is evals[1])
+//! g(r, rest) = sum over j in 0..k of L_j(r) · g(elements[j], rest).
 //! ```
 //!
-//! The line equation `(1 - r)·A + r·B` slides between A and B by fraction r —
-//! at r=0 you get A, at r=1 you get B, and for any other r you extrapolate
-//! along the same line.
+//! For arbitrary `r ∈ F` this evaluates `g` at the **new** input `(r, rest)`
+//! using only the `k` stored values along the corresponding `x_1`-slice.
 //!
-//! #### Sanity check with r = 5
+//! ### Boolean collapse — why this **is** the old `(1 - r)·A + r·B`
 //!
-//! Direct (using the polynomial):
+//! Specialise to `D = {0, 1}` (`k = 2`, `elements = [0, 1]`):
 //!
 //! ```text
-//! f(5, 0, 0) = 1 + 2·5 = 11
+//! L_0(r) = (r - elements[1]) / (elements[0] - elements[1])
+//!        = (r - 1) / (0 - 1)
+//!        = (r - 1) / (-1)
+//!        = 1 - r.
+//!
+//! L_1(r) = (r - elements[0]) / (elements[1] - elements[0])
+//!        = (r - 0) / (1 - 0)
+//!        = r.
 //! ```
 //!
-//! Via the interpolation formula on the eval pair:
+//! Plug those back in:
 //!
 //! ```text
-//! f(5, 0, 0) = (1 - 5)·evals[0] + 5·evals[1]
-//!            = (-4)·1 + 5·3
-//!            = -4 + 15
-//!            = 11
+//! g(r, rest) = L_0(r)·g(0, rest) + L_1(r)·g(1, rest)
+//!            = (1 - r)·g(0, rest) + r·g(1, rest).
 //! ```
 //!
-//! **Same answer, 11.** The formula is just the line equation, valid for any r.
+//! That is **exactly** the Boolean line-interpolation formula
+//! `(1 - r)·A + r·B`. The generic Lagrange path collapses to it as a
+//! strict special case — no extra arithmetic, just `k = 2` plugged in.
+//! This is the central pedagogical point of the generalisation: the
+//! Boolean line is `|D| = 2` of a more general story.
 //!
-//! #### Why pairs?
+//! ### Storage-layout pairing (now: `k`-tuples, not pairs)
 //!
-//! Each pair `(evals[2k], evals[2k+1])` shares the same "rest" — same
-//! `(x_2, ..., x_v)` — but differs in x_1 (LSB). So each pair gives the two
-//! endpoints of one line:
+//! Under mixed-radix LSB-first storage, the `k` evaluations sharing a fixed
+//! `(x_2, ..., x_n)` "rest" but differing only in `x_1` are at the
+//! **contiguous** indices
 //!
 //! ```text
-//! (evals[0], evals[1]) = (1, 3)   → line at (x_2, x_3) = (0, 0)
-//! (evals[2], evals[3]) = (4, 6)   → line at (x_2, x_3) = (1, 0)
-//! (evals[4], evals[5]) = (5, 7)   → line at (x_2, x_3) = (0, 1)
-//! (evals[6], evals[7]) = (8, 10)  → line at (x_2, x_3) = (1, 1)
+//! { j + rest_idx · k : j ∈ 0..k }     for each rest_idx ∈ [0, k^{n-1}).
 //! ```
 //!
-//! Apply `(1 - r)·left + r·right` to each pair to slide along the corresponding
-//! line at value r:
+//! (For `k = 2` this reduces to the adjacent pair `(2·rest_idx, 2·rest_idx+1)`.)
+//! [`fix_first_variable`](MultivariatePoly::fix_first_variable)
+//! precomputes the `k` weights `L_0(r), ..., L_{k-1}(r)` once, then for each
+//! `rest_idx` builds the new evaluation as a single `k`-term dot product
+//! against that contiguous slice of stored values.
+//!
+//! **Question for the reader.** Why do we fold via `fix_first_variable` n times
+//! instead of summing the full `k^n`-term symbolic Lagrange expression? Count
+//! the operations.
+//! Try to answer before reading on.
+//!
+//! The DP fold does `k^n + k^{n-1} + ... + k = k(k^n - 1)/(k - 1) = O(k^{n+1}/(k-1))`
+//! field ops — geometric in `k`, dominated by the first fold. Direct symbolic
+//! Lagrange is `O(n · k^n)`: every one of the `k^n` grid points contributes a
+//! product of `n` Lagrange weights to the sum. For `k = 2`, the DP is `O(2^n)`
+//! (the geometric series compresses to `2^{n+1} - 2`), while the direct
+//! symbolic Lagrange sum is `O(n · 2^n)` — `n` Lagrange weights per grid point,
+//! `k^n` grid points. Different big-O; the DP wins by a factor of `n`, not just
+//! a constant. For larger `k` the DP wins cleanly, and as a bonus storage stays
+//! in evaluation form throughout, so we never materialise `g` in coefficient form.
+//!
+//! ## Why DP for `evaluate` instead of summing the full Lagrange formula
+//!
+//! The direct multivariate-Lagrange evaluation at an arbitrary point
+//! `(r_1, ..., r_n) ∈ F^n` is
 //!
 //! ```text
-//! new_evals[0] = (1 - r)·1 + r·3  = 1 + 2r       → f(r, 0, 0)
-//! new_evals[1] = (1 - r)·4 + r·6  = 4 + 2r       → f(r, 1, 0)
-//! new_evals[2] = (1 - r)·5 + r·7  = 5 + 2r       → f(r, 0, 1)
-//! new_evals[3] = (1 - r)·8 + r·10 = 8 + 2r       → f(r, 1, 1)
+//! g(r_1, ..., r_n) = sum over (j_1, ..., j_n) in [0,k)^n of
+//!                       g(elements[j_1], ..., elements[j_n])
+//!                       · prod_{l=1..n} L_{j_l}(r_l).
 //! ```
 //!
-//! That's the new polynomial in evaluation form: `[1+2r, 4+2r, 5+2r, 8+2r]`.
-//!
-//! #### Cross-check via coefficient form
-//!
-//! Substitute x_1 = r directly in `1 + 2x_1 + 3x_2 + 4x_3`:
+//! That's `k^n` terms, each with `n` Lagrange-basis multiplications —
+//! `O(n · k^n)` total. We can do better: **fix one variable at a time**.
+//! Each call to [`fix_first_variable`](MultivariatePoly::fix_first_variable)
+//! reduces the eval count from `k^m` to `k^{m-1}` and costs `k^m` field
+//! ops. Summing the geometric series:
 //!
 //! ```text
-//! f(r, x_2, x_3) = (1 + 2r) + 3·x_2 + 4·x_3
+//! k^n + k^{n-1} + ... + k = k · (k^n - 1) / (k - 1)  =  O(k^{n+1}).
 //! ```
 //!
-//! Then evaluate at the 4 corners of {0,1}^2:
+//! For `k = 2` that's `O(2^{n+1}) = O(2^n)` — linear in the input size `2^n`.
+//! For larger `k` it's still polynomial in `k^n`, vs the `O(n · k^n)` of the
+//! direct symbolic sum. And crucially, the implementation is **shared** with
+//! `fix_first_variable`: `evaluate` is just `n` applications of the same DP
+//! step that sumcheck itself uses, then read the single remaining value.
 //!
-//! ```text
-//! f(r, 0, 0) = 1 + 2r
-//! f(r, 1, 0) = 4 + 2r
-//! f(r, 0, 1) = 5 + 2r
-//! f(r, 1, 1) = 8 + 2r
-//! ```
+//! ## Why evaluation form?
 //!
-//! **Same answers as the eval form.** Eval form did it with 4 pair-interpolations
-//! over a vector. Coefficient form did it via symbolic substitution + 4 corner
-//! evaluations. Both correct, eval form is mechanically simpler.
-//!
-//! ### Step D — What about non-boolean inputs?
-//!
-//! At the very end of sumcheck, the verifier needs `f(r_1, r_2, r_3)` for some
-//! random field elements (not 0 or 1). The [`MultilinearPoly::evaluate`] method
-//! reconstructs that on demand using the MLE formula — see the formula on its
-//! docstring. We never need to materialize the polynomial expression
-//! `1 + 2x_1 + 3x_2 + 4x_3` to do this.
+//! Sumcheck's hot paths all consume `g`-values on `S^n`, not symbolic
+//! coefficients. The verifier needs `H = sum over x in S^n of g(x)` (free
+//! given the eval table — just add the stored values) and round messages
+//! built from `g`-values along slices of `S^n` (each just a contiguous
+//! `k`-tuple of stored values, no re-evaluation of `g`). The only point
+//! where `g` is "really" evaluated at non-`S` inputs is the verifier's
+//! final check at `(r_1, ..., r_n) ∈ F^n` — and even that goes through
+//! the same DP, not through symbolic substitution into a coefficient form
+//! we never materialise.
 
+use crate::domain::{BooleanHypercube, SumDomain};
 use crate::field::Fp;
 
-/// A multilinear polynomial in `num_vars` variables, stored as evaluations on `{0,1}^num_vars`.
+/// A multivariate polynomial in `n_vars` variables, stored as its evaluations
+/// on the product domain `D^n_vars`.
+///
+/// Evaluations are laid out in **mixed-radix LSB-first** order: index
+/// `i = i_1 + i_2 · k + ... + i_n · k^{n-1}` (with `k = |D|`) corresponds to
+/// the input `(elements[i_1], ..., elements[i_n])`, so the first variable
+/// `x_1` is least significant and the `k` evaluations sharing a fixed
+/// `(x_2, ..., x_n)` "rest" sit at contiguous indices.
+/// [`Self::fix_first_variable`] performs the Lagrange step
+/// `g(r, rest) = sum_j L_j(r) · g(elements[j], rest)` along that contiguous
+/// `k`-slice; for `D = BooleanHypercube` (`k = 2`) this collapses to the
+/// familiar `(1 - r)·g(0, rest) + r·g(1, rest)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MultilinearPoly {
-    /// Number of variables `v`.
-    pub num_vars: usize,
-    /// Evaluations on `{0,1}^v` in the convention described in the module docs.
+pub struct MultivariatePoly<D: SumDomain> {
+    /// The per-variable summation domain `S ⊆ F`.
+    pub domain: D,
+    /// Number of variables `n`.
+    pub n_vars: usize,
+    /// Evaluations on `D^n_vars`. Length must equal `|D|^n_vars`.
+    /// Mixed-radix LSB-first indexed (see module docs).
     pub evals: Vec<Fp>,
 }
 
-impl MultilinearPoly {
-    /// Construct a multilinear polynomial from its evaluations on `{0,1}^num_vars`.
+/// Backward-compatible alias for the Boolean-hypercube case.
+///
+/// The historical [`MultilinearPoly`] (Boolean MLE) is exactly
+/// `MultivariatePoly<BooleanHypercube>`. Existing call sites and narrative
+/// in tests/demo can keep using the familiar name.
+pub type MultilinearPoly = MultivariatePoly<BooleanHypercube>;
+
+impl<D: SumDomain> MultivariatePoly<D> {
+    /// Construct a [`MultivariatePoly`] from its evaluations on `D^n_vars`.
     ///
-    /// Panics if `evals.len() != 2^num_vars`.
-    pub fn new(num_vars: usize, evals: Vec<Fp>) -> Self {
-        // TODO: validate that evals.len() == 1 << num_vars (i.e., 2^num_vars).
-        // Use assert_eq! with a clear message.
-        assert_eq!(evals.len(), 1 << num_vars, "evaluations length must be 2^num_vars");
-        MultilinearPoly{ num_vars, evals }
+    /// `evals` must be laid out in **mixed-radix LSB-first** order: index
+    /// `i = i_1 + i_2·k + ... + i_n·k^{n-1}` with `k = |D|` corresponds to
+    /// `g(elements[i_1], elements[i_2], ..., elements[i_n])`. See the module
+    /// docs for the full layout.
+    ///
+    /// Panics if `evals.len() != |D|^n_vars`.
+    pub fn new(domain: D, n_vars: usize, evals: Vec<Fp>) -> Self {
+        let k = domain.size();
+        let expected_len = pow_usize(k, n_vars);
+        assert_eq!(
+            evals.len(),
+            expected_len,
+            "evaluations length must be |D|^n_vars = {}^{} = {}",
+            k,
+            n_vars,
+            expected_len,
+        );
+        Self { domain, n_vars, evals }
     }
 
-    /// Evaluate the multilinear extension at a point in `F^v`.
+    /// Compute `H = sum over x in D^n_vars of g(x)`.
     ///
-    /// Uses the standard MLE formula:
-    /// `f(r) = sum over b in {0,1}^v of f(b) * chi_b(r)` where
-    /// `chi_b(r) = product over i of (b_i * r_i + (1 - b_i) * (1 - r_i))`.
-    ///
-    /// Panics if `point.len() != self.num_vars`.
-    pub fn evaluate(&self, point: &[Fp]) -> Fp {
-        // TODO:
-        //   1. Validate point length.
-        //   2. For each b in 0..2^num_vars:
-        //        bit_decompose b into [b_0, ..., b_{num_vars-1}]
-        //        compute chi_b(point) = prod_i (b_i * point[i] + (1-b_i) * (1 - point[i]))
-        //        accumulate self.evals[b] * chi_b(point) into result
-        //   3. Return result.
-        //
-        // Hint: this is O(v · 2^v). Fine for our toy sizes (v <= 10).
-        // For large v we'd use a "fix one variable at a time" approach with O(2^v) total work.
-        assert_eq!(point.len(), self.num_vars);
-
-        let mut result = Fp::zero();
-
-        for b in 0..self.evals.len() {
-            // `b` indexes one Boolean hypercube point.
-            //
-            // Example for 3 variables:
-            //   b = 0 = 000 means point (0, 0, 0)
-            //   b = 1 = 001 means point (1, 0, 0)
-            //   b = 2 = 010 means point (0, 1, 0)
-            //   b = 3 = 011 means point (1, 1, 0)
-            //
-            // `chi_b` is the selector/weight for this Boolean point.
-            // It starts at 1 because we are about to multiply one factor per variable.
-            let mut chi_b = Fp::one();
-
-            for i in 0..self.num_vars {
-                // Extract the i-th bit of b.
-                //
-                // If this bit is 1, then this Boolean point has coordinate x_i = 1.
-                // If this bit is 0, then this Boolean point has coordinate x_i = 0.
-                let bit_is_one = ((b >> i) & 1) == 1;
-
-                if bit_is_one {
-                    // For a Boolean coordinate equal to 1, use point[i].
-                    //
-                    // This factor is:
-                    //   0 when point[i] = 0
-                    //   1 when point[i] = 1
-                    chi_b *= point[i];
-                } else {
-                    // For a Boolean coordinate equal to 0, use 1 - point[i].
-                    //
-                    // This factor is:
-                    //   1 when point[i] = 0
-                    //   0 when point[i] = 1
-                    chi_b *= Fp::one() - point[i];
-                }
-            }
-
-            // Add this Boolean value's contribution to the final evaluation:
-            //
-            //   contribution = f(b) * chi_b(point)
-            //
-            // where self.evals[b] is f(b).
-            result += self.evals[b] * chi_b;
-        }
-
-        result
-    }
-
-    /// Compute the sum over the boolean hypercube: `H = sum over b in {0,1}^v of f(b)`.
-    pub fn sum_over_hypercube(&self) -> Fp {
-        // TODO: just sum self.evals. One line via the Sum trait.
+    /// `O(|D|^n_vars)` — just sum the stored evaluations. This is the
+    /// quantity sumcheck proves; in evaluation form it's already in hand.
+    pub fn sum_over_domain(&self) -> Fp {
         self.evals.iter().copied().sum()
     }
 
-    /// Fix the first variable to a value `r`, returning a polynomial in `v-1` variables.
+    /// Replace `x_1` with the field element `r`, returning the resulting
+    /// polynomial in `n_vars - 1` variables on the same domain.
     ///
     /// # What it does
     ///
-    /// Plugs `r` into the first slot of `f`, leaving the remaining variables free:
+    /// Specialises `g` along the `x_1` axis:
     ///
     /// ```text
-    /// f'(x_2, x_3, ..., x_v) = f(r, x_2, x_3, ..., x_v)
+    /// g'(x_2, ..., x_n) = g(r, x_2, ..., x_n).
     /// ```
     ///
-    /// The output polynomial has one fewer variable than the input.
+    /// `r` may be *any* field element, not just an element of `D` — sumcheck's
+    /// verifier picks it uniformly at random from all of `F`.
     ///
-    /// # Why the interpolation formula works
+    /// # Why and how (Lagrange along one axis)
     ///
-    /// `f` is multilinear, so along the `x_1` axis it's a **straight line**
-    /// (degree 1 in `x_1`). For any fixed values of the other variables, the
-    /// graph of `f` against `x_1` is just a line passing through two known
-    /// points: `f(0, rest)` and `f(1, rest)`.
-    ///
-    /// Linear interpolation between those two points gives:
+    /// For fixed `(x_2, ..., x_n) = rest`, the function `x_1 -> g(x_1, rest)`
+    /// is a polynomial of degree `< k` in one variable (per-variable degree
+    /// bound). By the Lagrange interpolation theorem, the `k` values
+    /// `g(elements[j], rest)` for `j ∈ 0..k` determine that univariate
+    /// polynomial uniquely, and we can read off its value at `r` as
     ///
     /// ```text
-    /// f(r, rest) = (1 - r) * f(0, rest) + r * f(1, rest)
+    /// g(r, rest) = sum over j in 0..k of L_j(r) · g(elements[j], rest)
     /// ```
     ///
-    /// (The same `(1 - t) * A + t * B` formula you'd use to slide between any
-    /// two points on a line.)
+    /// where `L_j(x) = prod_{i ≠ j} (x - elements[i]) / (elements[j] - elements[i])`
+    /// is the Lagrange basis polynomial that is `1` at `elements[j]` and `0`
+    /// at every other element of `D`. For the Boolean case `D = {0, 1}` this
+    /// collapses to `(1 - r)·g(0, rest) + r·g(1, rest)` — the familiar line
+    /// interpolation.
     ///
-    /// # In terms of `evals`
+    /// # Implementation
     ///
-    /// Under the LSB-first convention (see module docs), pairs of evaluations
-    /// that differ only in `x_1` are at **adjacent indices**: `(0, 1)`, `(2, 3)`,
-    /// `(4, 5)`, etc. So the new evaluation vector is built as:
+    /// We precompute the `k` Lagrange weights `L_j(r)` **once** before the
+    /// outer loop, since they don't depend on `rest`. Under the mixed-radix
+    /// LSB-first layout, the `k` stored values that share the same `rest`
+    /// are at contiguous indices `rest_idx·k + j` for `j ∈ 0..k` — one
+    /// `k`-element slice per output index. The output of length `k^{n-1}`
+    /// is built by `k^{n-1}` independent `k`-term dot products.
     ///
-    /// ```text
-    /// new_evals[i] = (1 - r) * evals[2*i] + r * evals[2*i + 1]
-    /// ```
+    /// Cost: `O(k^n)` field operations, plus `O(k^2)` for the basis weights.
     ///
-    /// for `i = 0, 1, ..., 2^(v-1) - 1`.
-    ///
-    /// # Concrete example with v = 3
-    ///
-    /// The original `f` has 8 evaluations. Fixing `x_1 = r` produces an `f'`
-    /// with 4 evaluations. For instance, the new `f'(0, 1)` (with `x_2 = 0`,
-    /// `x_3 = 1`) is computed from the old `evals[4]` and `evals[5]`, which
-    /// store `f(0, 0, 1)` and `f(1, 0, 1)` respectively:
-    ///
-    /// ```text
-    /// new_evals[2] = (1 - r) * evals[4] + r * evals[5]
-    ///              = (1 - r) * f(0, 0, 1) + r * f(1, 0, 1)
-    ///              = f(r, 0, 1)
-    /// ```
-    ///
-    /// Panics if `self.num_vars == 0`.
+    /// Panics if `self.n_vars == 0`.
     pub fn fix_first_variable(&self, r: Fp) -> Self {
-        // Steps:
-        //   1. Assert num_vars > 0.
-        //   2. Allocate a new evals vector of length 2^(num_vars - 1).
-        //   3. For each new_index in 0..new_len:
-        //        old_pair_x1_zero = new_index << 1       (bit 0 = 0)
-        //        old_pair_x1_one  = (new_index << 1) | 1 (bit 0 = 1)
-        //        new_eval[new_index] = (1 - r) * evals[old_pair_x1_zero]
-        //                                  + r * evals[old_pair_x1_one]
-        //   4. Return MultilinearPoly with num_vars - 1.
+        // TODO: produce a polynomial in `n_vars - 1` variables whose
+        //   evals on `S^{n-1}` are `g(r, rest)` for each `rest ∈ S^{n-1}`.
+        //   1. Precompute the `|D|` Lagrange weights `L_j(r)` once (they don't
+        //      depend on `rest`, so factor them out of the loop).
+        //   2. For each `rest_idx` in `0..block_size`, take the contiguous
+        //      `k`-slice `evals[rest_idx*k .. rest_idx*k + k]` (the `x_1`-axis
+        //      values at this `rest`) and dot it against `weights`.
+        //   3. Push the dot-product result into `new_evals`.
+        //   See the "Fixing x_1 = r" and "Mixed-radix indexing primer" sections
+        //   above for the derivation and the contiguous-slice layout.
         //
-        // Hint: use Fp::one() - r for (1 - r).
+        //   Reference implementation below.
+
         assert!(
-            self.num_vars > 0,
-            "cannot fix a variable in a zero-variable polynomial"
+            self.n_vars > 0,
+            "cannot fix a variable in a zero-variable polynomial",
         );
 
-        let new_num_vars = self.num_vars - 1;
-        let new_len = 1 << new_num_vars;
+        let elements = self.domain.elements();
+        let k = elements.len();
+
+        // Precompute Lagrange weights L_j(r) for j ∈ 0..k. They depend only
+        // on `r` and the domain, not on the `rest` slice.
+        let weights: Vec<Fp> = (0..k)
+            .map(|j| lagrange_basis_at(elements, j, r))
+            .collect();
+
+        // Output has |D|^{n - 1} evaluations.
+        let new_n_vars = self.n_vars - 1;
+        let new_len = pow_usize(k, new_n_vars);
         let mut new_evals = Vec::with_capacity(new_len);
 
-        for new_index in 0..new_len {
-            // Because the first variable is stored in bit 0, the two old indices
-            // that differ only in the first variable are:
-            //
-            //   old_index_with_x1_0 = new_index shifted left by 1, with bit 0 = 0
-            //   old_index_with_x1_1 = same index, but with bit 0 = 1
-            //
-            // Example:
-            //   new_index = 2 = 10
-            //   old_zero = 100
-            //   old_one  = 101
-            let old_index_with_x1_0 = new_index << 1;
-            let old_index_with_x1_1 = old_index_with_x1_0 | 1;
+        for rest_idx in 0..new_len {
+            // The `k` evaluations sharing this `rest_idx` lie at indices
+            // `rest_idx · k + j` for j ∈ 0..k — a contiguous slice, since
+            // x_1 is the least significant mixed-radix digit.
+            let base = rest_idx * k;
+            let slice = &self.evals[base..base + k];
 
-            let eval_at_zero = self.evals[old_index_with_x1_0];
-            let eval_at_one = self.evals[old_index_with_x1_1];
-
-            // Interpolate between f(0, rest) and f(1, rest):
-            //
-            //   f(r, rest) = (1-r) * f(0, rest) + r * f(1, rest)
-            let fixed_eval = (Fp::one() - r) * eval_at_zero + r * eval_at_one;
-
-            new_evals.push(fixed_eval);
+            // f'(rest) = sum_j L_j(r) · f(elements[j], rest).
+            let mut acc = Fp::zero();
+            for j in 0..k {
+                acc += weights[j] * slice[j];
+            }
+            new_evals.push(acc);
         }
 
-        Self::new(new_num_vars, new_evals)
+        Self {
+            domain: self.domain.clone(),
+            n_vars: new_n_vars,
+            evals: new_evals,
+        }
     }
+
+    /// Evaluate `g` at an arbitrary point `(r_1, ..., r_n) ∈ F^n` via repeated
+    /// [`fix_first_variable`](Self::fix_first_variable).
+    ///
+    /// Each call shrinks the polynomial by one variable; after `n_vars`
+    /// calls we have a 0-variable polynomial with a single stored value,
+    /// which is `g(r_1, ..., r_n)`.
+    ///
+    /// Cost: `O(|D|^{n_vars + 1})` — geometric sum of `|D|^m` for
+    /// `m = 1..n_vars`. For `|D| = 2` this is `O(2^n)`, sharing its
+    /// implementation with the sumcheck inner step (`fix_first_variable`).
+    ///
+    /// Panics if `point.len() != self.n_vars`.
+    pub fn evaluate(&self, point: &[Fp]) -> Fp {
+        // TODO: return `g(point[0], ..., point[n_vars-1])` via the DP
+        //   fold rather than expanding the full symbolic Lagrange sum.
+        //   1. Clone `self` into a mutable `current` (we'll mutate it round-by-round).
+        //   2. Loop over `r_i` in `point`, calling `fix_first_variable(r_i)`;
+        //      each call drops one variable and rebuilds evals using Lagrange
+        //      weights along the first axis (same step sumcheck uses).
+        //   3. After `n_vars` folds, `current` has 0 variables and a single
+        //      stored value — that is `g(r_1, ..., r_n)`. Return it.
+        //   Cost is `O(k^{n+1})` field ops vs `O(n · k^n)` for the direct
+        //   k^n-term symbolic Lagrange expansion; see the "Why DP for `evaluate`
+        //   instead of summing the full Lagrange formula" section above.
+        //
+        //   Reference implementation below.
+
+        assert_eq!(point.len(), self.n_vars);
+        let mut current = self.clone();
+        for &p in point {
+            current = current.fix_first_variable(p);
+        }
+        // After n_vars folds, current is the unique 0-variable poly: one entry.
+        current.evals[0]
+    }
+}
+
+// Boolean-hypercube convenience: the test and demo narrative talks about
+// "sum over the Boolean hypercube". Expose that as a thin alias of the
+// generic `sum_over_domain`.
+impl MultivariatePoly<BooleanHypercube> {
+    /// Alias of [`MultivariatePoly::sum_over_domain`] specialised to the
+    /// Boolean case. Provided so the historic terminology
+    /// ("sum over the Boolean hypercube") still has a clear name in the
+    /// `D = BooleanHypercube` setting.
+    pub fn sum_over_hypercube(&self) -> Fp {
+        self.sum_over_domain()
+    }
+}
+
+/// Evaluate the Lagrange basis polynomial `L_i` at `target`, where the
+/// basis is built over `points`:
+///
+/// ```text
+/// L_i(target) = prod_{j ≠ i} (target - points[j]) / (points[i] - points[j]).
+/// ```
+///
+/// `L_i` is the unique degree-`< points.len()` polynomial that is `1` at
+/// `points[i]` and `0` at every other `points[j]`.
+///
+/// The caller must ensure that the elements of `points` are **pairwise
+/// distinct**; otherwise the denominator `(points[i] - points[j])` for some
+/// `j ≠ i` would be zero and have no field inverse. In this crate `points`
+/// is always [`SumDomain::elements`], which is required to be distinct by
+/// the [`SumDomain`] contract.
+fn lagrange_basis_at(points: &[Fp], i: usize, target: Fp) -> Fp {
+    // TODO: evaluate `L_i(target)` for the basis built over `points`.
+    //   1. numerator   = prod over j ≠ i of (target - points[j])   — the part
+    //      that vanishes whenever `target` is some other `points[j]`.
+    //   2. denominator = prod over j ≠ i of (points[i] - points[j]) — the
+    //      normalising constant that makes `L_i(points[i]) = 1`.
+    //   3. Return `numerator * denominator.inverse()`. Inverting is safe
+    //      because the `points` are pairwise distinct (SumDomain contract),
+    //      so every factor `(points[i] - points[j])` for `j ≠ i` is nonzero
+    //      and thus has a field inverse.
+    //
+    //   Reference implementation below.
+
+    let mut numerator = Fp::one();
+    let mut denominator = Fp::one();
+    let xi = points[i];
+    for (j, &xj) in points.iter().enumerate() {
+        if j == i {
+            continue;
+        }
+        numerator *= target - xj;
+        denominator *= xi - xj;
+    }
+    // SAFE: denominator is a product of nonzero terms because `points` is
+    // pairwise distinct (SumDomain contract / caller's responsibility).
+    numerator
+        * denominator
+            .inverse()
+            .expect("Lagrange denominator is zero — domain elements must be distinct")
+}
+
+/// `base^exp` for `usize`. Used only for the length check `|D|^n_vars`.
+/// Returns 1 when `exp == 0` (matching `pow(0) == 1` for our domain sizes).
+fn pow_usize(base: usize, exp: usize) -> usize {
+    let mut acc: usize = 1;
+    for _ in 0..exp {
+        acc *= base;
+    }
+    acc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Interval3;
+
+    // -------------------------------------------------------------------
+    // Boolean-hypercube tests carried over from the pre-refactor API,
+    // now constructed via the generic constructor.
+    // -------------------------------------------------------------------
 
     #[test]
     fn evaluate_at_boolean_input_returns_eval() {
-        // TODO: for a small poly, evaluate at a point in {0, 1}^v and assert
-        // it equals the corresponding evals entry.
-        // For 2 variables, indices correspond to bits of the index:
+        // For 2 variables, the mixed-radix LSB-first layout (k = 2) reads:
         //
-        //   evals[0] = f(0, 0) because 0 = 00
-        //   evals[1] = f(1, 0) because 1 = 01
-        //   evals[2] = f(0, 1) because 2 = 10
-        //   evals[3] = f(1, 1) because 3 = 11
-        let poly = MultilinearPoly::new(
+        //   evals[0] = f(0, 0)   because 0 = 00
+        //   evals[1] = f(1, 0)   because 1 = 01
+        //   evals[2] = f(0, 1)   because 2 = 10
+        //   evals[3] = f(1, 1)   because 3 = 11
+        let poly = MultivariatePoly::new(
+            BooleanHypercube,
             2,
             vec![Fp::new(10), Fp::new(20), Fp::new(30), Fp::new(40)],
         );
@@ -477,10 +558,9 @@ mod tests {
 
     #[test]
     fn fix_then_evaluate_matches_full_evaluate() {
-        // TODO: fix x_1 = r, then evaluate at (r_2, ..., r_v); compare against
-        // the full evaluation at (r, r_2, ..., r_v). They must be equal.
-        // A 3-variable polynomial with 8 evaluations.
-        let poly = MultilinearPoly::new(
+        // 3-variable multilinear with 8 evaluations.
+        let poly = MultivariatePoly::new(
+            BooleanHypercube,
             3,
             vec![
                 Fp::new(1),
@@ -498,13 +578,11 @@ mod tests {
         let r2 = Fp::new(7);
         let r3 = Fp::new(11);
 
-        // First fix x_1 = r, producing a 2-variable polynomial.
+        // First fix x_1 = r → 2-variable poly, then evaluate at (r2, r3).
         let fixed = poly.fix_first_variable(r);
-
-        // Then evaluate the reduced polynomial at (r2, r3).
         let fixed_eval = fixed.evaluate(&[r2, r3]);
 
-        // This should match evaluating the original polynomial at (r, r2, r3).
+        // Must match a full evaluation at (r, r2, r3).
         let full_eval = poly.evaluate(&[r, r2, r3]);
 
         assert_eq!(fixed_eval, full_eval);
@@ -512,12 +590,71 @@ mod tests {
 
     #[test]
     fn sum_over_hypercube_matches_naive() {
-        // TODO: a tautology test, but write it to exercise the API.
         let evals = vec![Fp::new(3), Fp::new(5), Fp::new(7), Fp::new(9)];
-        let poly = MultilinearPoly::new(2, evals.clone());
+        let poly = MultivariatePoly::new(BooleanHypercube, 2, evals.clone());
 
         let expected = evals[0] + evals[1] + evals[2] + evals[3];
 
         assert_eq!(poly.sum_over_hypercube(), expected);
+    }
+
+    // -------------------------------------------------------------------
+    // New tests on Interval3 (|S| = 3) — these exercise the generic
+    // Lagrange-interpolation path that the Boolean special-case wouldn't
+    // catch a bug in.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fix_first_variable_on_interval3_lagrange_collapse() {
+        // 1-var polynomial g(x) = x on S = {0, 1, 2}.
+        // Stored evals = [g(0), g(1), g(2)] = [0, 1, 2].
+        let poly = MultivariatePoly::new(
+            Interval3,
+            1,
+            vec![Fp::new(0), Fp::new(1), Fp::new(2)],
+        );
+
+        // fix x = 5  →  g'(rest) = g(5) = 5. New poly has 0 variables and
+        // a single stored evaluation equal to 5.
+        let fixed = poly.fix_first_variable(Fp::new(5));
+        assert_eq!(fixed.n_vars, 0);
+        assert_eq!(fixed.evals, vec![Fp::new(5)]);
+    }
+
+    #[test]
+    fn evaluate_matches_sum_for_interval3() {
+        // 2-var polynomial g(x, y) = x + y on S = {0, 1, 2}.
+        // Mixed-radix LSB-first order with x_1 = x, x_2 = y:
+        //
+        //   evals[0] = g(0, 0) = 0
+        //   evals[1] = g(1, 0) = 1
+        //   evals[2] = g(2, 0) = 2
+        //   evals[3] = g(0, 1) = 1
+        //   evals[4] = g(1, 1) = 2
+        //   evals[5] = g(2, 1) = 3
+        //   evals[6] = g(0, 2) = 2
+        //   evals[7] = g(1, 2) = 3
+        //   evals[8] = g(2, 2) = 4
+        let poly = MultivariatePoly::new(
+            Interval3,
+            2,
+            vec![
+                Fp::new(0),
+                Fp::new(1),
+                Fp::new(2),
+                Fp::new(1),
+                Fp::new(2),
+                Fp::new(3),
+                Fp::new(2),
+                Fp::new(3),
+                Fp::new(4),
+            ],
+        );
+
+        // evaluate at (7, 0) — Lagrange interp gives g(7, 0) = 7 + 0 = 7.
+        assert_eq!(poly.evaluate(&[Fp::new(7), Fp::new(0)]), Fp::new(7));
+
+        // Sum over S^2 = {0,1,2}^2: 0+1+2+1+2+3+2+3+4 = 18.
+        assert_eq!(poly.sum_over_domain(), Fp::new(18));
     }
 }

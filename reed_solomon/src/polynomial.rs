@@ -121,15 +121,14 @@ impl UnivariatePoly {
     /// expression first — `d` multiplications, `d` additions. No precomputed
     /// powers of `X`.
     pub fn evaluate(&self, x: Fp) -> Fp {
-        // TODO:
-        //   - For the zero polynomial (empty coeffs), return Fp::zero().
-        //   - Otherwise, fold from the highest-degree coefficient down:
-        //       result = 0
-        //       for c in coeffs.iter().rev():
-        //           result = result * x + c
-        //       return result
+        // TODO: compute `p(x)` in `n` muls + `n` adds via Horner's method.
+        //   1. Start `result = 0` (handles the zero-polynomial case for free).
+        //   2. Iterate coefficients from high index to low: `result = result * x + c_i`.
+        //   3. After the last iteration `result = a_0 + x(a_1 + x(a_2 + ...))`.
+        // See the "Worked example: p(X) = 1 + 2X + 3X^2" in the module docs —
+        // it shows the inner accumulator at every step.
         //
-        //   Use `iter().rev()` for the reverse-order traversal.
+        // Reference implementation below.
         if self.coeffs.is_empty() {
             Fp::zero()
         } else {
@@ -289,8 +288,8 @@ mod tests {
 
     #[test]
     fn mul_degrees_add() {
-        // TODO: p of degree 2, q of degree 3; (p * q).degree() == Some(5)
-        // (assuming non-zero leading coefficients).
+        // p of degree 1, q of degree 2; (p * q).degree() == Some(1 + 2) = Some(3)
+        // — degrees add for nonzero polynomials.
         let p = UnivariatePoly::new(vec![Fp::one(), Fp::new(2)]);
         let q = UnivariatePoly::new(vec![Fp::one(), Fp::new(3), Fp::new(4)]);
 

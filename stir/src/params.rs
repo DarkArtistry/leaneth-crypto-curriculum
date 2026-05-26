@@ -17,6 +17,95 @@
 //! aggregates the per-round soundness errors into a total `log₂`
 //! cheating probability.
 //!
+//! ## Anchor: STIR is a proximity test for a Reed-Solomon code
+//!
+//! Every variable in this struct only makes sense if you remember what
+//! the protocol is actually doing. Fix a finite field `F`, an evaluation
+//! domain `L_0 ⊂ F` of size `N = |L_0|`, and a degree bound `d_0`. The
+//! **Reed-Solomon code** at these parameters is
+//!
+//! ```text
+//!   RS[F, L_0, d_0] = { (p(x))_{x ∈ L_0} : p ∈ F[X], deg(p) < d_0 } ⊂ F^N.
+//! ```
+//!
+//! The prover commits to a function `f_0 : L_0 → F` and claims it is
+//! δ-close (in Hamming distance) to some codeword in `RS[F, L_0, d_0]`.
+//! STIR is a low-query, low-randomness IOP that lets a verifier **test
+//! that proximity claim**. Every per-round soundness number, every
+//! query-count formula in this module, every parameter tweak, exists to
+//! make it hard for a prover to fool that one test.
+//!
+//! ### The rate `ρ_0 = d_0 / |L_0|` — the load-bearing knob
+//!
+//! `RS[F, L_0, d_0]` is a linear code with block length `n = |L_0|` and
+//! dimension `k = d_0` (a polynomial of degree `< d_0` is determined by
+//! `d_0` coefficients, so there are `d_0` degrees of freedom in a
+//! codeword). Its **rate** is the textbook coding-theory rate
+//!
+//! ```text
+//!   ρ_0 := dimension / block-length = d_0 / |L_0|.
+//! ```
+//!
+//! Two equivalent intuitions, both worth keeping in the head:
+//!
+//! 1. **Information density on the wire.** Out of `|L_0|` symbols
+//!    transmitted, only `d_0` carry independent information; the
+//!    remaining `|L_0| − d_0` are redundancy. `ρ_0` is the fraction
+//!    that "matters" — and `1 − ρ_0` is the redundancy that makes the
+//!    code error-correcting.
+//!
+//! 2. **How rare a codeword is among all functions `L_0 → F`.** Count:
+//!    `|RS| = |F|^{d_0}`, total `|F|^{|L_0|}`, so codewords occupy a
+//!    `|F|^{-(1 − ρ_0) · |L_0|}` fraction of `F^{|L_0|}`. Low `ρ_0` ⇒
+//!    codewords are an astronomically tiny sliver of all possible
+//!    tables ⇒ a uniformly random function is far from `RS` with
+//!    overwhelming probability ⇒ the verifier can catch a cheating
+//!    prover from very few spot checks.
+//!
+//! Concrete numerical extremes (`|L_0| = 64` fixed):
+//!
+//! - `d_0 = 16` → `ρ_0 = 1/4`. Singleton relative distance ≈ 3/4: any
+//!   two distinct codewords disagree on ≥ 3/4 of positions. A single
+//!   spot-check catches a non-codeword with prob ≈ 3/4. **Strong.**
+//! - `d_0 = 63` → `ρ_0 ≈ 63/64`. Relative distance ≈ 1/64. A cheating
+//!   function can agree with a codeword on ~63 of every 64 positions;
+//!   you would need dozens of queries to catch it. **Protocol
+//!   degenerates.**
+//!
+//! Slogan to memorise: **low rate ⇒ large minimum distance ⇒ strong
+//! soundness per query**. The link is the Singleton bound, met with
+//! equality by Reed-Solomon: `δ_min = 1 − ρ_0 + 1/|L_0| ≈ 1 − ρ_0`.
+//! FRI/STIR soundness analyses lean on this (and on Johnson-bound
+//! list-decoding up to radius `1 − √ρ_0`).
+//!
+//! ### Why STIR ≡ "Shift To Improve Rate"
+//!
+//! The acronym is literal. FRI keeps `ρ_i = ρ_0` constant across
+//! rounds: it folds the polynomial by `k` (degree `d_i → d_i / k`) and
+//! shrinks the domain by `k` (size `|L_i| → |L_i| / k`), so their
+//! ratio is unchanged. STIR's twist: fold the degree by `k` but shrink
+//! the domain by only `k/2`. Then
+//!
+//! ```text
+//!   ρ_{i+1} = d_{i+1} / |L_{i+1}|
+//!           = (d_i / k) / (|L_i| / (k/2))
+//!           = ρ_i · (k/2) / k
+//!           = ρ_i / 2.
+//! ```
+//!
+//! **The rate halves every round, independent of `k`.** Each round the
+//! code gets sparser, each round soundness per query gets stronger, so
+//! STIR's late rounds buy more security per query than its early
+//! rounds. That improving rate is exactly what makes the *declining*
+//! harmonic query schedule `(t_0, t_1, ..., t_M)` work — see the
+//! repetition-schedule discussion below.
+//!
+//! Mental model to keep: **every fold tries to make the code sparser;
+//! STIR just does it more aggressively than FRI** by decoupling the
+//! domain-shrink rate from the degree-shrink rate. The full algebra of
+//! the rate drop is restated in §"Rate-drop formula" below, and the
+//! domain-shrink half of it is proved in §"Domain-shrink formula".
+//!
 //! ## Worked numeric example
 //!
 //! Pick a small instance that fits in hand calculations:
@@ -225,6 +314,16 @@ pub struct StirParams {
     /// Stored separately from `log_initial_domain_size`/`initial_degree_bound`
     /// for convenience; [`StirParams::validate`] cross-checks
     /// consistency.
+    ///
+    /// **What `ρ_0` *means*** — and why it is the single most
+    /// load-bearing knob in this struct — is in the module-level
+    /// §"Anchor: STIR is a proximity test for a Reed-Solomon code".
+    /// Short version: `ρ_0` is the rate of the Reed-Solomon code
+    /// `RS[F, L_0, d_0]` whose proximity STIR is testing; low rate ⇒
+    /// large minimum distance ⇒ strong soundness per query. The whole
+    /// protocol is engineered to drive `ρ_i` down by a factor of 2 each
+    /// round (see §"Why STIR ≡ Shift To Improve Rate"), so `ρ_0` is
+    /// also the starting point of that geometric decay.
     pub rate_log_inv: u32,
 
     /// `λ` — the target **security bits**.
@@ -332,8 +431,90 @@ impl StirParams {
         //      for each `i`, plus a final `t_final` of similar size.
         //   7. Cross-check `validate()` would accept the result; panic with
         //      a clear message if not.
-        let _ = (log_initial_domain_size, initial_degree_bound, folding_factor);
-        todo!()
+        // (1) Structural checks on `k` — module doc §"Why the bounds".
+        assert!(
+            folding_factor >= K_MIN,
+            "folding_factor must be ≥ K_MIN ({K_MIN}); got {folding_factor}",
+        );
+        assert!(
+            folding_factor.is_power_of_two(),
+            "folding_factor must be a power of 2; got {folding_factor}",
+        );
+
+        // (2) Rate ≤ 1 — i.e. d_0 ≤ |L_0|. We further insist `d_0` is a
+        // power of 2 so that ρ_0 = 1 / 2^{rate_log_inv} is a clean
+        // dyadic rate (the soundness analysis assumes this).
+        let domain_size: usize = 1usize << log_initial_domain_size;
+        assert!(
+            initial_degree_bound <= domain_size,
+            "initial_degree_bound ({initial_degree_bound}) must be ≤ \
+             |L_0| = 2^{log_initial_domain_size} = {domain_size}",
+        );
+        assert!(
+            initial_degree_bound.is_power_of_two(),
+            "initial_degree_bound must be a power of 2 (clean dyadic \
+             rate); got {initial_degree_bound}",
+        );
+
+        // (3) ρ_0 = d_0 / |L_0| ⇒ rate_log_inv = log|L_0| − log d_0.
+        //     `trailing_zeros` is log₂ for any power of 2 — no float ops,
+        //     no precision issues.
+        //     Beware: a naive `initial_degree_bound / domain_size`
+        //     truncates to 0 for any non-trivial rate; do NOT compute
+        //     the rate that way.
+        let log_initial_degree_bound: u32 = initial_degree_bound.trailing_zeros();
+        let rate_log_inv: u32 = log_initial_domain_size - log_initial_degree_bound;
+        assert!(
+            rate_log_inv >= 1,
+            "rate must be strictly < 1 (need d_0 < |L_0|)",
+        );
+
+        // (4) Round-count theorem (module doc §"Round-count formula"):
+        //         M = ⌈ log_k(d_0 / d_M) ⌉.
+        //     With default stopping_degree d_M = 1 this is
+        //         M = ⌈ log_k(d_0) ⌉ = ⌈ log₂(d_0) / log₂(k) ⌉.
+        let log_folding_factor: u32 = folding_factor.trailing_zeros();
+        let num_rounds: u32 = log_initial_degree_bound.div_ceil(log_folding_factor);
+        assert!(
+            num_rounds >= 1,
+            "derived num_rounds = 0 (d_0 too small relative to k); \
+             increase d_0 or shrink k",
+        );
+
+        // (5) Paper §5 defaults.
+        let stopping_degree: usize = 1;
+        let ood_samples: u32 = 2;
+        let security_bits: u32 = 128;
+
+        // (6) Harmonic schedule per §4.3:
+        //         t_i = ⌈ λ / (M · log₂(1/ρ_i)) ⌉.
+        //     Rate-drop formula (module doc) gives ρ_i = ρ_0 / 2^i, so
+        //     log₂(1/ρ_i) = rate_log_inv + i. The (M+1)-th entry covers
+        //     the final-round index queries on |L_M|.
+        let repetition_schedule: Vec<u32> = (0..=num_rounds)
+            .map(|i| {
+                let log_inv_rho_i = rate_log_inv + i;
+                let denom = num_rounds * log_inv_rho_i;
+                security_bits.div_ceil(denom)
+            })
+            .collect();
+
+        // (7) Self-check before handing the params out.
+        let params = Self {
+            log_initial_domain_size,
+            initial_degree_bound,
+            folding_factor,
+            num_rounds,
+            rate_log_inv,
+            security_bits,
+            repetition_schedule,
+            ood_samples,
+            stopping_degree,
+        };
+        params
+            .validate()
+            .expect("StirParams::new produced an invalid configuration");
+        params
     }
 
     /// Retune the parameter set for a target security level `λ`.
@@ -344,17 +525,20 @@ impl StirParams {
     /// # Paper reference
     ///
     /// The formula for `t_i` given `λ` is in §4.3 of eprint 2024/390.
-    pub fn with_security_bits(self, lambda: u32) -> Self {
-        // TODO:
-        //   1. Recompute `repetition_schedule`: for each round `i`,
-        //      `t_i = ceil(lambda / (num_rounds · log(1/ρ_i)))` where
-        //      `ρ_i = ρ_0 · (1/2)^i` (rate-drop formula from module docs).
-        //   2. Set the final entry `t_final` similarly using the final
-        //      domain's rate.
-        //   3. Update `self.security_bits = lambda`.
-        //   4. Return `self`.
-        let _ = lambda;
-        todo!()
+    pub fn with_security_bits(mut self, lambda: u32) -> Self {
+        // Harmonic schedule per §4.3:
+        //     t_i = ⌈ λ / (M · log₂(1/ρ_i)) ⌉,
+        // with log₂(1/ρ_i) = rate_log_inv + i (rate-drop formula).
+        // The (M+1)-th entry covers the final-round index queries.
+        self.repetition_schedule = (0..=self.num_rounds)
+            .map(|i| {
+                let log_inv_rho_i = self.rate_log_inv + i;
+                let denom = self.num_rounds * log_inv_rho_i;
+                lambda.div_ceil(denom)
+            })
+            .collect();
+        self.security_bits = lambda;
+        self
     }
 
     /// Override `num_rounds` directly. Builder-style.
@@ -363,49 +547,40 @@ impl StirParams {
     /// protocol over a non-default round count. Production callers should
     /// usually trust the default derived from `log_initial_domain_size /
     /// log_2(folding_factor)`.
-    pub fn with_num_rounds(self, num_rounds: u32) -> Self {
-        // TODO: set `self.num_rounds = num_rounds` and return `self`.
-        // Caller is responsible for keeping `repetition_schedule.len() ==
-        // num_rounds + 1` consistent.
-        let _ = num_rounds;
-        todo!()
+    pub fn with_num_rounds(mut self, num_rounds: u32) -> Self {
+        self.num_rounds = num_rounds;
+        self
     }
 
     /// Override `rate_log_inv` (the initial rate as `1 / 2^rate_log_inv`).
     /// Builder-style.
-    pub fn with_rate_log_inv(self, rate_log_inv: u32) -> Self {
-        // TODO: set `self.rate_log_inv = rate_log_inv` and return `self`.
-        let _ = rate_log_inv;
-        todo!()
+    pub fn with_rate_log_inv(mut self, rate_log_inv: u32) -> Self {
+        self.rate_log_inv = rate_log_inv;
+        self
     }
 
     /// Override `ood_samples` (the OOD sample count `s`). Builder-style.
     ///
     /// Provable soundness uses `s = 1`; the conjectured tighter analysis
     /// from §4.3 of eprint 2024/390 allows `s = 2`.
-    pub fn with_ood_samples(self, ood_samples: u32) -> Self {
-        // TODO: set `self.ood_samples = ood_samples` and return `self`.
-        let _ = ood_samples;
-        todo!()
+    pub fn with_ood_samples(mut self, ood_samples: u32) -> Self {
+        self.ood_samples = ood_samples;
+        self
     }
 
     /// Override `stopping_degree`. Builder-style.
-    pub fn with_stopping_degree(self, stopping_degree: usize) -> Self {
-        // TODO: set `self.stopping_degree = stopping_degree` and return
-        // `self`.
-        let _ = stopping_degree;
-        todo!()
+    pub fn with_stopping_degree(mut self, stopping_degree: usize) -> Self {
+        self.stopping_degree = stopping_degree;
+        self
     }
 
     /// Override `repetition_schedule` directly. Builder-style.
     ///
     /// The slice should have length `num_rounds + 1` (one entry per round
     /// plus a final-round entry).
-    pub fn with_repetition_schedule(self, schedule: Vec<u32>) -> Self {
-        // TODO: set `self.repetition_schedule = schedule` and return
-        // `self`. Caller is responsible for `schedule.len() == num_rounds + 1`.
-        let _ = schedule;
-        todo!()
+    pub fn with_repetition_schedule(mut self, schedule: Vec<u32>) -> Self {
+        self.repetition_schedule = schedule;
+        self
     }
 
     /// `d_i = d_0 / k^round` — the degree bound at round `round`.
@@ -417,14 +592,15 @@ impl StirParams {
     ///
     /// Panics if `round > num_rounds`.
     pub fn round_degree_bound(&self, round: u32) -> usize {
-        // TODO:
-        //   1. Panic if `round > self.num_rounds`.
-        //   2. Compute `k_pow = folding_factor.pow(round)`.
-        //   3. Return `self.initial_degree_bound / (k_pow as usize)` (integer
-        //      division — exact under our power-of-2 conventions).
-        //   4. Cross-reference §"Round-count formula" in the module docs.
-        let _ = round;
-        todo!()
+        assert!(
+            round <= self.num_rounds,
+            "round {round} exceeds num_rounds ({})",
+            self.num_rounds,
+        );
+        // d_i = d_0 / k^round — module doc §"Round-count formula".
+        // Exact integer division under our power-of-2 conventions.
+        let k_pow = (self.folding_factor as usize).pow(round);
+        self.initial_degree_bound / k_pow
     }
 
     /// `log₂|L_round|` — the binary log of the round-`round` domain
@@ -438,17 +614,22 @@ impl StirParams {
     /// Panics if `round > num_rounds` or if the formula would produce
     /// a negative result (parameter mis-tune).
     pub fn round_log_domain_size(&self, round: u32) -> u32 {
-        // TODO:
-        //   1. Panic if `round > self.num_rounds`.
-        //   2. Compute `log_k_over_2 = log2(folding_factor / 2)` —
-        //      well-defined since `folding_factor` is a power of 2 ≥ 4,
-        //      so `k/2` is a power of 2 ≥ 2.
-        //   3. Compute `log_size = self.log_initial_domain_size - round * log_k_over_2`.
-        //      Panic if underflow (caller has mis-tuned `num_rounds`).
-        //   4. Return `log_size`.
-        //   5. Cross-reference §"Domain-shrink formula" in the module docs.
-        let _ = round;
-        todo!()
+        assert!(
+            round <= self.num_rounds,
+            "round {round} exceeds num_rounds ({})",
+            self.num_rounds,
+        );
+        // log|L_i| = log|L_0| − i · log₂(k/2) — module doc §"Domain-shrink
+        // formula". Safe: folding_factor ≥ K_MIN = 4 ⇒ k/2 ≥ 2 is a
+        // power of 2, so log₂(k/2) = log₂(k) − 1 ≥ 1.
+        let log_k_over_2 = self.folding_factor.trailing_zeros() - 1;
+        let decrement = round * log_k_over_2;
+        assert!(
+            self.log_initial_domain_size >= decrement,
+            "domain underflow at round {round}: log|L_0| = {} < decrement = {decrement}",
+            self.log_initial_domain_size,
+        );
+        self.log_initial_domain_size - decrement
     }
 
     /// Verify the parameter invariants documented on each field.
@@ -458,21 +639,38 @@ impl StirParams {
     /// run `validate()` after any field assignment and before invoking
     /// [`crate::protocol::run_stir`].
     pub fn validate(&self) -> Result<(), &'static str> {
-        // TODO:
-        //   1. Reject `folding_factor < K_MIN` — "STIR requires k ≥ 4
-        //      (paper §4.2)".
-        //   2. Reject `folding_factor` not a power of 2 — "FFT requires
-        //      power-of-2 fold size".
-        //   3. Reject `repetition_schedule.len() != (num_rounds + 1) as usize`.
-        //   4. Reject `num_rounds < 1`.
-        //   5. Reject `initial_degree_bound > 1 << log_initial_domain_size`
-        //      — "rate must be ≤ 1".
-        //   6. Reject `stopping_degree < 1 || stopping_degree > initial_degree_bound`.
-        //   7. Reject `rate_log_inv < 1` — "rate must be strictly < 1".
-        //   8. Reject `security_bits < 1` and `ood_samples < 1` — see
-        //      module-doc CAUTION block.
-        //   9. Return Ok(()).
-        todo!()
+        if self.folding_factor < K_MIN {
+            return Err("folding_factor < K_MIN (STIR requires k ≥ 4, paper §4.2)");
+        }
+        if !self.folding_factor.is_power_of_two() {
+            return Err("folding_factor must be a power of 2 (FFT requires power-of-2 fold size)");
+        }
+        if self.num_rounds < 1 {
+            return Err("num_rounds must be ≥ 1");
+        }
+        if self.repetition_schedule.len() != (self.num_rounds as usize) + 1 {
+            return Err("repetition_schedule.len() must equal num_rounds + 1");
+        }
+        let domain_size: usize = 1usize << self.log_initial_domain_size;
+        if self.initial_degree_bound > domain_size {
+            return Err("initial_degree_bound > |L_0| (rate must be ≤ 1)");
+        }
+        if self.stopping_degree < 1 {
+            return Err("stopping_degree must be ≥ 1");
+        }
+        if self.stopping_degree > self.initial_degree_bound {
+            return Err("stopping_degree must be ≤ initial_degree_bound");
+        }
+        if self.rate_log_inv < 1 {
+            return Err("rate_log_inv must be ≥ 1 (rate strictly < 1)");
+        }
+        if self.security_bits < 1 {
+            return Err("security_bits must be ≥ 1");
+        }
+        if self.ood_samples < 1 {
+            return Err("ood_samples must be ≥ 1 (s = 0 disables OOD collapse)");
+        }
+        Ok(())
     }
 
     /// Produce a round-by-round soundness report for this parameter
@@ -483,20 +681,38 @@ impl StirParams {
     /// Use this to verify the parameter choice hits the desired `λ` —
     /// the total should be ≤ `-self.security_bits`.
     pub fn soundness_report(&self) -> RbrSoundnessReport {
-        // TODO:
-        //   1. For each round `i ∈ 0..=num_rounds`:
-        //        a. compute `ρ_i = round_degree_bound(i) / 2^round_log_domain_size(i)`,
-        //        b. compute per-round error `err_i = ρ_i^{t_i}` (in log₂
-        //           form, `log2(err_i) = t_i · log2(ρ_i)`),
-        //        c. push `log2(err_i)` into `per_round_errors`.
-        //   2. Sum the per-round errors in linear space (i.e. exp-sum then
-        //      log) to get `total_error_log2`. Use the formula
-        //      `log2(Σ 2^{e_i}) = max(e_i) + log2(Σ 2^{e_i - max(e_i)})`
-        //      to avoid float overflow when one round dominates.
-        //   3. Return the `RbrSoundnessReport`.
-        //   4. Cross-reference §"Why the bounds" — the harmonic schedule
-        //      should produce nearly-uniform per-round errors.
-        todo!()
+        // Per-round error: err_i = ρ_i^{t_i}, so
+        //     log₂(err_i) = t_i · log₂(ρ_i) = − t_i · (rate_log_inv + i).
+        // (Rate-drop formula: ρ_i = ρ_0 / 2^i ⇒ log₂(1/ρ_i) = rate_log_inv + i.)
+        // A well-tuned harmonic schedule produces nearly-uniform errors;
+        // see module doc §"Why the bounds".
+        let per_round_errors: Vec<f64> = self
+            .repetition_schedule
+            .iter()
+            .enumerate()
+            .map(|(i, &t_i)| {
+                let log_inv_rho_i = self.rate_log_inv + i as u32;
+                -(t_i as f64) * (log_inv_rho_i as f64)
+            })
+            .collect();
+
+        // Log-sum-exp in base 2 to avoid float underflow when one round
+        // dominates the cheating probability:
+        //     log₂(Σ 2^{e_i}) = m + log₂(Σ 2^{e_i − m}), m = max_i e_i.
+        let max_e = per_round_errors
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let sum_shifted: f64 = per_round_errors
+            .iter()
+            .map(|&e| (e - max_e).exp2())
+            .sum();
+        let total_error_log2 = max_e + sum_shifted.log2();
+
+        RbrSoundnessReport {
+            per_round_errors,
+            total_error_log2,
+        }
     }
 }
 
@@ -505,42 +721,70 @@ mod tests {
     use super::*;
 
     /// `validate()` must reject any `folding_factor < K_MIN`, since the
-    /// soundness analysis assumes `k ≥ 4`.
+    /// soundness analysis assumes `k ≥ 4`. Build the struct manually
+    /// (bypassing `new`, which would panic on these inputs before
+    /// `validate` could run).
     #[test]
     fn params_validate_rejects_k_less_than_4() {
-        // TODO:
-        //   1. Build a `StirParams` with `folding_factor = 2` (otherwise
-        //      sensible: log_initial_domain_size = 6, initial_degree_bound = 16,
-        //      etc.).
-        //   2. Call `validate()` and assert it returns `Err(_)` with a
-        //      message mentioning "k ≥ 4" or "folding_factor".
-        //   3. Repeat for `folding_factor = 3` (non-power-of-2).
-        todo!()
+        let too_small_k = StirParams {
+            log_initial_domain_size: 6,
+            initial_degree_bound: 16,
+            folding_factor: 2, // ← violation: k < K_MIN
+            num_rounds: 2,
+            rate_log_inv: 2,
+            security_bits: 128,
+            repetition_schedule: vec![1, 1, 1],
+            ood_samples: 2,
+            stopping_degree: 1,
+        };
+        let err = too_small_k.validate().unwrap_err();
+        assert!(
+            err.contains("k ≥ 4") || err.contains("K_MIN"),
+            "unexpected error: {err}",
+        );
+
+        // k = 5 satisfies `k ≥ K_MIN` so the first check passes; the
+        // power-of-2 check is what should fire.
+        let non_power_of_two = StirParams {
+            folding_factor: 5,
+            ..too_small_k
+        };
+        let err = non_power_of_two.validate().unwrap_err();
+        assert!(
+            err.contains("power of 2"),
+            "unexpected error: {err}",
+        );
     }
 
-    /// `round_degree_bound(round)` must equal `d_0 / k^round`.
+    /// `round_degree_bound(round)` must equal `d_0 / k^round`. Uses the
+    /// module-doc worked example.
     #[test]
     fn round_degree_bound_is_d_divided_by_k_to_round() {
-        // TODO:
-        //   1. Build `StirParams::new(6, 16, 4)` (the module-doc worked
-        //      example).
-        //   2. Assert `round_degree_bound(0) == 16`.
-        //   3. Assert `round_degree_bound(1) == 4`.
-        //   4. Assert `round_degree_bound(2) == 1`.
-        todo!()
+        let params = StirParams::new(6, 16, 4);
+        assert_eq!(params.round_degree_bound(0), 16);
+        assert_eq!(params.round_degree_bound(1), 4);
+        assert_eq!(params.round_degree_bound(2), 1);
     }
 
     /// `soundness_report().per_round_errors` must have length
-    /// `num_rounds + 1`.
+    /// `num_rounds + 1`, and every entry must be strictly negative
+    /// (each `err_i ∈ (0, 1)` so `log₂(err_i) < 0`).
     #[test]
-    fn soundness_report_has_M_entries() {
-        // TODO:
-        //   1. Build a `StirParams` with `num_rounds = 3`.
-        //   2. Call `soundness_report()`.
-        //   3. Assert `report.per_round_errors.len() == 4`
-        //      (`num_rounds + 1` per the field doc).
-        //   4. Assert each entry is strictly negative (a probability < 1
-        //      has negative log).
-        todo!()
+    fn soundness_report_has_m_plus_one_entries() {
+        // StirParams::new(8, 64, 4) → ρ_0 = 1/4, num_rounds = 3.
+        let params = StirParams::new(8, 64, 4);
+        assert_eq!(params.num_rounds, 3);
+
+        let report = params.soundness_report();
+        assert_eq!(report.per_round_errors.len(), 4);
+        for (i, &e) in report.per_round_errors.iter().enumerate() {
+            assert!(e < 0.0, "round {i}: log₂(err_i) should be < 0, got {e}");
+        }
+        // Total cheating prob should also be a real negative number.
+        assert!(
+            report.total_error_log2 < 0.0 && report.total_error_log2.is_finite(),
+            "total_error_log2 should be finite and negative; got {}",
+            report.total_error_log2,
+        );
     }
 }

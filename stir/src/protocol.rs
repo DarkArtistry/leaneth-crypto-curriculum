@@ -1,5 +1,20 @@
 //! End-to-end STIR orchestrator.
 //!
+//! ## Anchor: STIR's top-level orchestrator
+//!
+//! This module is the user-facing entry point to the STIR proof system.
+//! Every other module in this crate ([`crate::prover`], [`crate::verifier`],
+//! [`crate::transcript`], [`crate::merkle`], …) provides one building block;
+//! [`run_stir`] and [`run_stir_with_verification`] are the two functions that
+//! compose those blocks into a complete honest-prover-and-verifier flow.
+//! If you're using STIR as a library — to prove proximity of a function to a
+//! Reed-Solomon code, or as the proximity-test sub-protocol inside a
+//! transparent SNARK — these two functions are what you call. Internally
+//! they each construct a fresh [`crate::transcript::Transcript`] seeded with
+//! the same domain separator on both sides, then invoke
+//! [`crate::prover::StirProver::prove`] followed by
+//! [`crate::verifier::StirVerifier::verify`].
+//!
 //! ## What this module does
 //!
 //! Two top-level entry points, both wrapping the round-by-round dance
@@ -71,13 +86,9 @@ use reed_solomon::UnivariatePoly;
 
 use crate::params::StirParams;
 use crate::proof::StirProof;
-// NOTE: `StirProver`, `StirVerifier`, and `Transcript` are referenced by name
-// in the TODO blocks below and in the rustdoc. The actual `use` statements
-// will be added once the function bodies are implemented; for now they would
-// be flagged as unused-imports.
-// use crate::prover::StirProver;
-// use crate::transcript::Transcript;
-// use crate::verifier::StirVerifier;
+use crate::prover::StirProver;
+use crate::transcript::Transcript;
+use crate::verifier::StirVerifier;
 
 /// The transcript domain separator used by this crate's protocol entry
 /// points. Distinct per-protocol literal protects against cross-protocol
@@ -104,26 +115,24 @@ pub fn run_stir(
     params: StirParams,
     polynomial: UnivariatePoly,
 ) -> Result<StirProof, &'static str> {
-    // TODO:
-    //   1. Defensive input check: `if let Some(d) = polynomial.degree() {
-    //         if d >= params.initial_degree_bound {
-    //             return Err("run_stir: polynomial degree exceeds initial_degree_bound");
-    //         }
-    //      }`
-    //      WHY: catch the most common caller mistake (wrong-degree witness)
-    //      at the protocol boundary instead of deep inside the prover.
-    //   2. Build a fresh transcript:
-    //         let mut transcript = Transcript::new(STIR_DOMAIN_SEPARATOR);
-    //      WHY: domain separation prevents cross-protocol replay (see
-    //      module-level CAUTION).
-    //   3. Construct the prover and run it:
-    //         let prover = StirProver::new(params, polynomial);
-    //         let proof = prover.prove(&mut transcript);
-    //      WHY: ownership cleanly transfers; the prover's internal state
-    //      is consumed inside `prove`.
-    //   4. Return Ok(proof).
-    let _ = (params, polynomial);
-    todo!()
+    // (1) Defensive input check. The prover's constructor has a
+    //     debug-assert for this; we mirror it as a structured `Err` at
+    //     the protocol boundary so release builds report a clean error
+    //     instead of a soundness hole.
+    if let Some(d) = polynomial.degree() {
+        if d >= params.initial_degree_bound {
+            return Err("run_stir: polynomial degree exceeds initial_degree_bound");
+        }
+    }
+
+    // (2) Build a fresh transcript with the protocol's domain separator.
+    let mut transcript = Transcript::new(STIR_DOMAIN_SEPARATOR);
+
+    // (3) Construct the prover and produce the proof.
+    let prover = StirProver::new(params, polynomial);
+    let proof = prover.prove(&mut transcript);
+
+    Ok(proof)
 }
 
 /// Run the STIR prover then the verifier on the resulting proof.
@@ -150,67 +159,82 @@ pub fn run_stir_with_verification(
     params: StirParams,
     polynomial: UnivariatePoly,
 ) -> Result<(StirProof, bool), &'static str> {
-    // TODO:
-    //   1. Call `run_stir` to produce the proof. Propagate Err.
-    //      WHY: the prover-side error is the same as `run_stir`'s.
-    //   2. Build a FRESH verifier transcript with the same domain separator:
-    //         let mut transcript = Transcript::new(STIR_DOMAIN_SEPARATOR);
-    //      WHY: verifier and prover transcripts are independent objects;
-    //      they must converge by ABSORBING the same prover messages, not
-    //      by sharing state.
-    //   3. Construct the verifier:
-    //         let verifier = StirVerifier::new(params.clone());
-    //      (`params` was moved into `run_stir`; clone before the move, or
-    //      restructure to keep `params` accessible — implementer's choice.
-    //      In a clean implementation, pass `params` by reference into a
-    //      shared helper. For the stub we keep the high-level shape clear.)
-    //   4. Run `let accepted = verifier.verify(&proof, &mut transcript).is_ok();`
-    //   5. Return `Ok((proof, accepted))`.
-    let _ = (params, polynomial);
-    todo!()
+    // (1) Run the honest prover. Propagate input-validation errors.
+    //     We clone the params first because `run_stir` moves them; the
+    //     verifier needs an independent copy.
+    let params_for_verifier = params.clone();
+    let proof = run_stir(params, polynomial)?;
+
+    // (2) Build a *fresh* verifier transcript with the same domain
+    //     separator. Verifier and prover transcripts are independent
+    //     objects that converge by absorbing the same prover messages
+    //     in the same order — see the module-level CAUTION.
+    let mut transcript = Transcript::new(STIR_DOMAIN_SEPARATOR);
+
+    // (3) Construct the verifier and run it. A verifier-side rejection
+    //     is NOT an `Err`; it is `Ok((proof, false))`.
+    let verifier = StirVerifier::new(params_for_verifier);
+    let accepted = verifier.verify(&proof, &mut transcript).is_ok();
+
+    Ok((proof, accepted))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reed_solomon::Fp;
+
+    /// Demo params used across the protocol-layer tests.
+    fn demo_params() -> StirParams {
+        StirParams::new(6, 16, 4)
+            .with_security_bits(32)
+            .with_ood_samples(1)
+            .with_stopping_degree(4)
+            .with_repetition_schedule(vec![8, 4, 2])
+    }
+
+    fn demo_polynomial() -> UnivariatePoly {
+        let coeffs: Vec<Fp> = (1u64..=15).map(Fp::new).collect();
+        UnivariatePoly::new(coeffs)
+    }
 
     /// run_stir on a valid input produces a proof (Ok).
     #[test]
     fn run_stir_produces_proof() {
-        // TODO:
-        //   1. Build params (small). Build a low-degree polynomial.
-        //   2. let result = run_stir(params, polynomial);
-        //   3. assert!(result.is_ok());
-        //   4. let proof = result.unwrap();
-        //   5. assert_eq!(proof.round_commitments.len(), params.num_rounds).
-        // WHY: smoke test the top-level entry point on the happy path.
-        todo!()
+        let params = demo_params();
+        let polynomial = demo_polynomial();
+        let m = params.num_rounds as usize;
+
+        let result = run_stir(params, polynomial);
+        assert!(result.is_ok(), "honest run_stir must succeed");
+
+        let proof = result.unwrap();
+        assert_eq!(proof.round_commitments.len(), m);
     }
 
     /// run_stir_with_verification accepts an honest prover.
     #[test]
     fn run_stir_with_verification_accepts_honest_prover() {
-        // TODO:
-        //   1. Build params (small). Build a low-degree polynomial.
-        //   2. let (proof, accepted) = run_stir_with_verification(params, polynomial).unwrap();
-        //   3. assert!(accepted, "honest prover must convince the verifier");
-        //   4. assert!(!proof.round_commitments.is_empty()).
-        // WHY: completeness of the protocol — the cornerstone happy-path
-        // contract.
-        todo!()
+        let params = demo_params();
+        let polynomial = demo_polynomial();
+
+        let (proof, accepted) =
+            run_stir_with_verification(params, polynomial).unwrap();
+        assert!(accepted, "honest prover must convince the verifier");
+        assert!(!proof.round_commitments.is_empty());
     }
 
     /// run_stir_with_verification rejects an input that exceeds the degree bound.
     #[test]
     fn run_stir_with_verification_rejects_low_degree_violator() {
-        // TODO:
-        //   1. Build params with initial_degree_bound = 4.
-        //   2. Build a polynomial of degree 8 (twice the bound).
-        //   3. let result = run_stir_with_verification(params, polynomial);
-        //   4. assert!(result.is_err()).
-        // WHY: the protocol must reject inputs outside its declared bound.
-        // This catches mis-specified callers before the verifier even
-        // gets a chance to run.
-        todo!()
+        // Default `StirParams::new(6, 16, 4)` has initial_degree_bound = 16.
+        // Build a polynomial whose degree exceeds the bound.
+        let params = StirParams::new(6, 16, 4);
+        let too_many_coeffs: Vec<Fp> =
+            (1u64..=20).map(Fp::new).collect(); // degree 19 ≥ 16
+        let polynomial = UnivariatePoly::new(too_many_coeffs);
+
+        let result = run_stir_with_verification(params, polynomial);
+        assert!(result.is_err(), "wrong-degree witness must Err");
     }
 }

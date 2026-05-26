@@ -1,19 +1,40 @@
 //! **DegCor** (degree correction) and **Combine** — STIR's degree-alignment
 //! primitives.
 //!
+//! ## Anchor: why STIR needs degree correction
+//!
+//! STIR's per-round arithmetic produces a folded/quotiented polynomial whose
+//! *actual* degree bound `d_high` is **smaller** than the degree bound `d*`
+//! that the **next round's Reed-Solomon code** is built around. Concretely,
+//! after Fold by factor `k` the degree drops by `k` but after Quotient the
+//! degree drops by a further `|S|` (the size of the OOD + shifted-query set);
+//! meanwhile the next round's RS code on the shrunken domain `L_{i+1}` was
+//! sized for a specific `d*_{i+1}` set by the rate-halving schedule (see
+//! [`crate::params`]'s rate-drop formula). The two numbers don't line up: the
+//! function in hand has degree `< d_high`, but to participate in the next
+//! round's proximity test it must be a codeword of `RS[F, L_{i+1}, d*]`.
+//!
+//! Re-evaluating the polynomial on the new domain would defeat STIR's whole
+//! reason to exist (no FFT per round). Instead, DegCor multiplies pointwise
+//! by a scaling polynomial `g_r(X)` of degree exactly `e = d* − d_high` —
+//! cheap, evaluation-form, **and** binds the new function to the verifier's
+//! randomness `r`. This last property is load-bearing: if the multiplier were
+//! the deterministic `X^e`, an adversarial prover would have a free hand to
+//! engineer the high coefficients; randomising via `g_r` forces them to
+//! commit to a single polynomial-in-`r` whose zero set Schwartz-Zippel says
+//! is a `(d*−d_high)/|F|` fraction of the field (the named theorem below).
+//!
 //! ## What this module does
 //!
-//! STIR's per-round arithmetic involves multiple polynomials of *different
-//! actual degrees* that the protocol wants to treat uniformly. DegCor
-//! patches the gap: given a polynomial `f` of degree `< d` over the
-//! Goldilocks field `F = F_p` and a **target degree bound** `d* ≥ d`,
-//! DegCor produces a "scaled" polynomial `f · g_r` of degree `< d*` whose
-//! evaluation table is bound to `f`'s by a verifier-chosen random scalar
-//! `r ∈ F_p` (the round's degree-correction randomness). The scaling
-//! polynomial is the **geometric-sum scaling polynomial**
-//! `g_r(X) := sum_{i=0..e} (rX)^i` with `e := d* − d`, defined formally
-//! below. A malicious prover who cheats on `f` cannot hide the cheat by
-//! claiming the wrong degree, because `r` enters the scaling factor.
+//! Given a polynomial `f` of degree `< d_high` over the Goldilocks field
+//! `F = F_p` and a **target degree bump** `e ≥ 0`, DegCor produces a "scaled"
+//! polynomial `f · g_r` of degree `< d_high + e = d*` whose evaluation table
+//! is bound to `f`'s by a verifier-chosen random scalar `r ∈ F_p` (the
+//! round's degree-correction randomness). The scaling polynomial is the
+//! **geometric-sum scaling polynomial**
+//! `g_r(X) := sum_{i=0..e} (rX)^i`, defined formally below. A malicious
+//! prover who cheats on `f` cannot hide the cheat by claiming the wrong
+//! degree, because `r` enters the scaling factor.
 //!
 //! Combine is the simpler sibling: given two codewords `a` and `b` (already
 //! on the same domain at the same target degree), `Combine(a, b, r) := a + r
@@ -87,7 +108,84 @@
 //! entry being `f(L[j]) · g_r(L[j])` as computed above. None of the four
 //! `r·x` values hit `1`, so the closed-form branch is exercised throughout.
 //!
-//! ## Named theorem
+//! ## Worked example for the Degree-Correction theorem (`d_high = 2`, `d_target = 4`, `α = 3`)
+//!
+//! This second example focuses on the structural theorem above. Take
+//! `d_high = 2` (polynomial degrees `< 2`, i.e. constants and linears),
+//! `d_target = 4`, so `e := d_target − d_high = 2`. In this codebase the
+//! geometric sum `g_r(X) := sum_{i=0..e} (rX)^i` runs `i = 0, 1, ..., e` —
+//! one term per "slot of degree bump" plus the constant — so for our
+//! parameters and `α = 3`,
+//!
+//! ```text
+//! g_r(X)  =  1 + (3X) + (3X)^2 + (3X)^3
+//!         =  1 + 3X + 9X^2 + 27X^3.
+//! ```
+//!
+//! The leading term is `27 X^3`, so `deg(g_r) = 3 = e + 1`. The theorem
+//! gives `deg(f · g_r) ≤ deg(f) + deg(g_r) ≤ (d_high − 1) + (e + 1) =
+//! d_target − 1` — i.e. `f · g_r ∈ RS[F, L, d_target]` as promised. Pick a
+//! concrete `f(X) = 1 + X ∈ RS[F, L, d_high = 2]`:
+//!
+//! ```text
+//! f(X) · g_r(X)  =  (1 + X) · (1 + 3X + 9X^2 + 27X^3)
+//!                =  (1 + 3X + 9X^2 + 27X^3)
+//!                 + (X + 3X^2 + 9X^3 + 27X^4)
+//!                =  1 + 4X + 12X^2 + 36X^3 + 27X^4.
+//! ```
+//!
+//! Top degree `4 = d_target`, so the product is in `RS[F, L, d_target + 1]`
+//! when `g_r` has degree exactly `e + 1` — which is the slack the protocol
+//! actually wants (it leaves "headroom" for the next round's Quotient to
+//! shave off the OOD/shifted-query constraints without dropping below the
+//! next round's RS code dimension). For a tight `RS[F, L, d_target]`
+//! membership use the `(e)`-degree variant `g_r(X) = 1 + 3X + 9X^2` instead.
+//!
+//! Pointwise on a hypothetical domain `L = {0, 1, 2}`:
+//!
+//! ```text
+//! L[0] = 0: f(0) = 1,   g_r(0) = 1,                    product = 1
+//! L[1] = 1: f(1) = 2,   g_r(1) = 1 + 3 + 9 + 27 = 40,  product = 80
+//! L[2] = 2: f(2) = 3,   g_r(2) = 1 + 6 + 36 + 216 = 259, product = 777.
+//! ```
+//!
+//! The convolution insight is that the high-coefficient `27 = α^{e+1}` of
+//! `f · g_r` is a polynomial of degree `e + 1` in `α`, so any adversary's
+//! claim about it is Schwartz-Zippel-bounded by `(e+1)/|F| = (d* − d)/|F|`
+//! up to a constant — the soundness theorem's bound.
+//!
+//! ## Named theorems
+//!
+//! ### Degree-Correction theorem (the structural statement)
+//!
+//! > **Degree-Correction.** Let `f ∈ RS[F, L, d_high]` (i.e. `f`'s evaluation
+//! > table on `L` agrees with some polynomial of degree `< d_high`). Let
+//! > `e := d_target − d_high ≥ 0` and let `g_r(X) := sum_{i=0..e} (r X)^i`
+//! > be the geometric-sum scaling polynomial for any `r ∈ F`. Then
+//! >
+//! > ```text
+//! > f · g_r  ∈  RS[F, L, d_target].
+//! > ```
+//! >
+//! > **Proof.** `f` is the evaluation table of some `p ∈ F[X]` with
+//! > `deg(p) < d_high`, i.e. `deg(p) ≤ d_high − 1`. `g_r` is a polynomial of
+//! > degree exactly `e` (its leading term `r^e X^e` is non-zero whenever
+//! > `r ≠ 0`, and is the zero polynomial collapsed to the constant `1` when
+//! > `r = 0`, in which case `deg(g_r) = 0 ≤ e`). In either case
+//! >
+//! > ```text
+//! > deg(p · g_r)  ≤  deg(p) + deg(g_r)
+//! >               ≤  (d_high − 1) + e
+//! >               =  d_high + e − 1
+//! >               =  d_target − 1.
+//! > ```
+//! >
+//! > So `p · g_r` has degree `< d_target`, and its evaluation table on `L`
+//! > is exactly the pointwise product `f[j] · g_r(L[j])` — which is the
+//! > vector this module's `deg_cor` returns. Hence `f · g_r ∈ RS[F, L,
+//! > d_target]`. ∎
+//!
+//! ### DegCor Soundness theorem (the adversarial statement)
 //!
 //! > **DegCor Soundness.** Let `f` be a function on the evaluation domain `L`
 //! > and `RS_d`, `RS_{d*}` the Reed-Solomon codes of degree bounds `< d` and
@@ -126,14 +224,31 @@
 //! ## Cross-module interface
 //!
 //! - [`deg_cor`] evaluates `f · g_r` on the domain (the operationally
-//!   important case).
+//!   important case for an evaluation-form prover).
+//! - [`poly_deg_cor`] multiplies a **coefficient-form** polynomial by
+//!   `g_r(X)` directly, returning a new polynomial of degree
+//!   `deg(poly) + e`. Used by the refactored prover (see
+//!   `stir-full-spec.md` §6) which keeps its round-`i` polynomial in
+//!   coefficient form (Fold/Quotient/DegCor all operate naturally on
+//!   coefficients in the refactor; no per-round IFFT needed).
+//! - [`eval_g_r`] evaluates the geometric-sum scaling polynomial
+//!   `g_r(X) = Σ_{i=0..e} (rX)^i` at a single field point using the
+//!   closed form `(1 − (rx)^{e+1}) / (1 − rx)` with the `rx == 1`
+//!   L'Hôpital branch returning `e + 1`. The verifier uses this to do
+//!   the per-query DegCor step pointwise without ever materialising
+//!   `g_r` as a polynomial.
 //! - [`combine`] does the round's linear combination of two evaluation
 //!   vectors.
 //!
-//! Both work on raw evaluation tables — no coefficient-form polynomial gets
-//! built or destroyed.
+//! `deg_cor` and `combine` work on raw evaluation tables; `poly_deg_cor`
+//! and `eval_g_r` are the coefficient-form / pointwise siblings. The
+//! **prover** in this refactor uses `poly_deg_cor` (one polynomial
+//! multiply per round, deg-`< d_{i+1}` output), while the **verifier**
+//! uses `eval_g_r` (one closed-form geometric-sum eval per shift query).
+//! Both compute the same algebraic object — the same `f · g_r` of the
+//! Degree-Correction theorem — at different granularities.
 
-use reed_solomon::{EvaluationDomain, Fp};
+use reed_solomon::{EvaluationDomain, Fp, UnivariatePoly};
 
 /// Degree-correct an evaluation table: scale `f` so that its effective
 /// degree bound becomes `target_degree`.
@@ -182,41 +297,48 @@ pub fn deg_cor(
     target_degree: usize,
     randomness: Fp,
 ) -> Vec<Fp> {
-    // TODO: pointwise multiply by g_r(L[j]).
-    //   1. Validate `evals.len() == domain.size()`.
-    //   2. Decide the input degree bound. In the educational scaffold we treat
-    //      it as implicit — say, derived from a STIR round struct the caller
-    //      maintains. For the test cases below, `target_degree == evals.len() - 1`
-    //      corresponds to "input is already at target degree" (e = 0, g_r = 1,
-    //      identity). When implementing, pick a calling convention and stick
-    //      to it: either take an extra argument, or document that
-    //      `target_degree - 0` (caller-tracked `e`) is passed.
-    //   3. Compute `e = target_degree - input_degree_bound`. Build a closure
-    //      `gr_at = |x: Fp| -> Fp` implementing the closed form:
+    // Calling convention (cross-ref §"What this module does" and the
+    // Degree-Correction theorem in the module docs): `target_degree` is the
+    // **degree bump** `e := d_target − d_high` that the caller has already
+    // computed from the protocol's round-by-round schedule. We don't take
+    // `d_high` separately — the caller tracks it in a STIR round struct and
+    // hands us only the gap. So:
     //
-    //        let rx = randomness * x;
-    //        if rx == Fp::one() {
-    //            // r·x = 1: the closed form 0/0 → direct sum is e + 1 ones.
-    //            Fp::new((e as u64) + 1)
-    //        } else {
-    //            // (1 - (rx)^{e+1}) / (1 - rx)
-    //            let num = Fp::one() - rx.pow((e as u64) + 1);
-    //            let den = Fp::one() - rx;
-    //            num * den.inverse().unwrap()
-    //        }
+    //   - `target_degree == 0` ⇒ e = 0 ⇒ g_r(X) = 1   (identity; see test (a))
+    //   - `target_degree  > 0` ⇒ e > 0 ⇒ g_r has e+1 terms.
     //
-    //   4. Walk `domain.iter()` and `evals` in lockstep:
-    //        output.push(evals[j] * gr_at(L[j]));
-    //   5. Return.
-    //
-    // CAUTION: if `target_degree < evals.len() - 1` (i.e. degree *shrinking*,
-    // not growing), this function is ill-defined; assert `target_degree >=
-    // input_degree_bound` (equivalently, `e >= 0`). Reduction is done via
-    // Quotient, not DegCor — the two operations are designed in tandem and
-    // confusing them silently would corrupt the round-by-round degree
-    // accounting.
-    let _ = (evals, domain, target_degree, randomness);
-    todo!()
+    // The "ill-defined degree-shrinking" case the scaffold cautioned about
+    // is now structurally impossible: `e` is a `usize`, hence `≥ 0`.
+    assert_eq!(
+        evals.len(),
+        domain.size(),
+        "deg_cor: evals.len() ({}) must equal domain.size() ({})",
+        evals.len(),
+        domain.size(),
+    );
+
+    let e = target_degree;
+    // `g_r` evaluated at a single domain point `x`, using the closed form
+    // (1 - (rx)^{e+1}) / (1 - rx) when rx ≠ 1, and the direct sum e + 1
+    // when rx = 1 (the 0/0 L'Hôpital branch).
+    let gr_at = |x: Fp| -> Fp {
+        let rx = randomness * x;
+        if rx == Fp::one() {
+            // Direct geometric sum: 1 + 1 + ... (e+1 ones) = e + 1.
+            Fp::new((e as u64) + 1)
+        } else {
+            let num = Fp::one() - rx.pow((e as u64) + 1);
+            let den = Fp::one() - rx;
+            num * den.inverse().expect("1 - rx ≠ 0 in this branch")
+        }
+    };
+
+    // One pass: pointwise product f(L[j]) · g_r(L[j]).
+    domain
+        .iter()
+        .zip(evals.iter())
+        .map(|(x, &fx)| fx * gr_at(x))
+        .collect()
 }
 
 /// Random linear combination of two codewords.
@@ -246,17 +368,138 @@ pub fn combine(
     evals_b: &[Fp],
     randomness: Fp,
 ) -> Vec<Fp> {
-    // TODO: pointwise random linear combination.
-    //   1. Validate `evals_a.len() == evals_b.len()`.
-    //   2. `output[j] = evals_a[j] + randomness * evals_b[j]`. One pass.
-    //   3. Return.
-    //
-    // This is the simplest of the three modules' primitives — but it's
-    // load-bearing for STIR soundness: like DegCor, it binds two codewords
-    // by a random scalar, so a cheating prover can't fix one codeword's
-    // error after seeing the challenge.
-    let _ = (evals_a, evals_b, randomness);
-    todo!()
+    // Simplest of the module's primitives — but load-bearing for STIR
+    // soundness: like `deg_cor`, it binds two codewords by a random scalar,
+    // so a cheating prover can't fix one codeword's error after seeing the
+    // challenge.
+    assert_eq!(
+        evals_a.len(),
+        evals_b.len(),
+        "combine: length mismatch ({} vs {})",
+        evals_a.len(),
+        evals_b.len(),
+    );
+
+    evals_a
+        .iter()
+        .zip(evals_b.iter())
+        .map(|(&a, &b)| a + randomness * b)
+        .collect()
+}
+
+/// Coefficient-form degree correction: multiply `poly` by the geometric-sum
+/// scaling polynomial `g_r(X) = Σ_{i=0..e} (r·X)^i`, returning a polynomial
+/// whose degree bound bumps up by exactly `e`.
+///
+/// This is the **prover's** companion to [`deg_cor`]: it computes the same
+/// algebraic object (the `f · g_r` of the Degree-Correction theorem above)
+/// but lands in coefficient form rather than on an evaluation table. The
+/// refactored prover (see `stir-full-spec.md` §2.1 and §6) keeps its
+/// round-`i` polynomial in coefficient form across Quotient → Fold →
+/// DegCor; this helper closes the loop so the round update stays
+/// coefficient-form end to end.
+///
+/// # Inputs
+/// - `poly`: input polynomial in coefficient form.
+/// - `e`: degree bump (= `d_target − d_high`). If `e == 0`,
+///   `g_r(X) = 1` and this returns `poly.clone()`.
+/// - `r`: verifier randomness (the `r_comb_i` squeeze in the per-round
+///   transcript schedule; see `stir-full-spec.md` §1.1).
+///
+/// # Output
+/// `UnivariatePoly` representing `poly(X) · g_r(X)`. Its degree bound is
+/// `deg(poly) + e`; trailing-zero stripping by `UnivariatePoly::new`
+/// gives the tight degree.
+///
+/// # Algorithm
+/// 1. Build the coefficient vector of `g_r`: `[1, r, r^2, ..., r^e]`,
+///    length `e + 1`. One running multiply per coefficient.
+/// 2. Convolve `poly.coeffs()` with `g_r_coeffs` naively in
+///    `O((d + e) · e)` field operations. For demo parameters `e ≤ 2`
+///    so this is effectively `O(d)`; no FFT needed.
+/// 3. Wrap via `UnivariatePoly::new` (strips trailing zeros — important
+///    for the Prover-Round Invariant's `deg(current_poly) < d_{i+1}`
+///    bookkeeping).
+///
+/// # Cross-reference
+/// See [`eval_g_r`] for the single-point evaluation used by the verifier
+/// to check `f · g_r` at a query point without building the polynomial.
+/// See the module-level **Degree-Correction theorem** for the algebraic
+/// guarantee `deg(poly · g_r) ≤ (d_high − 1) + e = d_target − 1`.
+pub fn poly_deg_cor(poly: &UnivariatePoly, e: usize, r: Fp) -> UnivariatePoly {
+    if e == 0 {
+        return poly.clone();
+    }
+
+    // (1) g_r coeffs: [1, r, r^2, ..., r^e].
+    let mut g_r_coeffs: Vec<Fp> = Vec::with_capacity(e + 1);
+    let mut acc = Fp::one();
+    for _ in 0..=e {
+        g_r_coeffs.push(acc);
+        acc = acc * r;
+    }
+
+    let in_coeffs = poly.coeffs();
+    if in_coeffs.is_empty() {
+        // poly is the zero polynomial — `0 · g_r = 0`.
+        return UnivariatePoly::zero();
+    }
+
+    // (2) Naive convolution. out[i+j] += a_i · b_j.
+    let out_len = in_coeffs.len() + g_r_coeffs.len() - 1;
+    let mut out = vec![Fp::zero(); out_len];
+    for (i, &a) in in_coeffs.iter().enumerate() {
+        for (j, &b) in g_r_coeffs.iter().enumerate() {
+            out[i + j] = out[i + j] + a * b;
+        }
+    }
+
+    // (3) Wrap, stripping trailing zeros.
+    UnivariatePoly::new(out)
+}
+
+/// Single-point evaluation of the geometric-sum scaling polynomial
+/// `g_r(X) = Σ_{i=0..e} (r·X)^i` at `x ∈ F_p`.
+///
+/// Uses the closed form
+///
+/// ```text
+/// g_r(x) = (1 − (r·x)^{e+1}) / (1 − r·x),     r·x ≠ 1
+///        = e + 1,                              r·x  = 1   (L'Hôpital branch)
+/// ```
+///
+/// This is the **verifier's** companion to [`poly_deg_cor`]: at a shift
+/// query the verifier has a single point `z_k` and needs `g_r(z_k)` to
+/// apply the DegCor multiplier locally; building `g_r` as a polynomial
+/// would be silly when one closed-form evaluation suffices.
+///
+/// # Inputs
+/// - `r`: verifier randomness (`r_comb_i`).
+/// - `x`: evaluation point.
+/// - `e`: degree of `g_r` minus one — i.e. `g_r` has `e + 1` terms.
+///   When `e == 0`, `g_r ≡ 1`, so the return value is `Fp::one()`
+///   regardless of `r` and `x` (the closed-form numerator `1 − rx`
+///   matches the denominator `1 − rx`, giving `1`; the special case is
+///   not strictly required but is documented here for cross-reference
+///   with [`poly_deg_cor`]'s `e == 0` early-return).
+///
+/// # Output
+/// `g_r(x) ∈ F_p`.
+///
+/// # Cross-reference
+/// See [`poly_deg_cor`] for the coefficient-form sibling. See the
+/// module-level "Computing `g_r(X)` efficiently" section for the
+/// derivation of the closed form and the `rx == 1` L'Hôpital branch.
+pub fn eval_g_r(r: Fp, x: Fp, e: usize) -> Fp {
+    let rx = r * x;
+    if rx == Fp::one() {
+        // Direct geometric sum: 1 + 1 + ... + 1 (e + 1 ones).
+        Fp::new((e as u64) + 1)
+    } else {
+        let num = Fp::one() - rx.pow((e as u64) + 1);
+        let den = Fp::one() - rx;
+        num * den.inverse().expect("1 - rx ≠ 0 in this branch")
+    }
 }
 
 // ============================================================================
@@ -268,52 +511,192 @@ mod tests {
     use super::*;
 
     /// With `r = 0`, `g_r(X) = 1 + 0 + 0 + ... = 1` (a constant), so
-    /// `f · g_r = f` and DegCor is the identity at the evaluation level.
+    /// `f · g_r = f` and DegCor is the identity at the evaluation level —
+    /// even with a non-trivial degree bump `e > 0`.
+    ///
+    /// Note: the domain `L` is the size-8 multiplicative subgroup of `F_p`,
+    /// and `0 ∈ F_p` is **not** in `L` (subgroups don't contain 0). So no
+    /// domain element `x` satisfies `r·x = 0·x = 0 = 1`, and the closed-form
+    /// branch (not the L'Hôpital branch) is what's exercised here.
     #[test]
     fn deg_cor_with_r_zero_is_identity() {
-        // TODO:
-        //   1. Build a domain `L` of size 8 and any evaluation vector
-        //      `evals = [Fp::new(1), Fp::new(2), ..., Fp::new(8)]`.
-        //   2. Pick `target_degree = some value > implied input bound` so
-        //      `e > 0` and `g_r(X)` actually has more than one term.
-        //   3. `result = deg_cor(&evals, &L, target_degree, Fp::zero())`.
-        //   4. Assert `result == evals`: with `r = 0`, every `rx` term vanishes,
-        //      `g_r(x) = 1` for all `x`, and the pointwise product is `f` itself.
-        todo!()
+        let domain = EvaluationDomain::new_subgroup(3); // |L| = 8
+        let evals: Vec<Fp> = (1..=8).map(Fp::new).collect();
+        // e = 5 (any positive bump); with r = 0 the result should still be `evals`.
+        let result = deg_cor(&evals, &domain, 5, Fp::zero());
+        assert_eq!(result, evals, "r = 0 ⇒ g_r ≡ 1 ⇒ deg_cor is identity");
     }
 
-    /// When `target_degree` equals the input degree bound, `e = 0` and
-    /// `g_r(X) = 1` (a single term). DegCor is the identity in that case
-    /// regardless of `r`.
+    /// When `target_degree == 0` (i.e. `e = 0`), `g_r(X) = (rX)^0 = 1`
+    /// (a single term). DegCor is the identity in that case regardless of `r`.
     #[test]
-    fn deg_cor_with_target_equals_input_returns_input() {
-        // TODO:
-        //   1. Build a domain of size 8 and `evals = [Fp::new(1), ..., Fp::new(8)]`.
-        //   2. Pick `target_degree = (whatever counts as the input degree bound
-        //      in your calling convention)`. With `e = 0`, `g_r(X) = (rX)^0 = 1`.
-        //   3. Call `deg_cor` with a non-trivial `randomness = Fp::new(13)`.
-        //   4. Assert the result equals `evals` entry-by-entry.
-        todo!()
+    fn deg_cor_with_e_zero_returns_input() {
+        let domain = EvaluationDomain::new_subgroup(3); // |L| = 8
+        let evals: Vec<Fp> = (1..=8).map(Fp::new).collect();
+        // Non-trivial randomness shouldn't matter — e = 0 collapses g_r to 1.
+        let result = deg_cor(&evals, &domain, 0, Fp::new(13));
+        assert_eq!(result, evals, "e = 0 ⇒ g_r ≡ 1 ⇒ deg_cor is identity");
     }
 
     /// `combine(a, b, 0) = a`: the `b` term vanishes.
     #[test]
     fn combine_with_r_zero_returns_first() {
-        // TODO:
-        //   1. Build `a = [Fp::new(10), Fp::new(20), Fp::new(30), Fp::new(40)]`.
-        //   2. Build `b = [Fp::new(7), Fp::new(11), Fp::new(13), Fp::new(17)]`.
-        //   3. Assert `combine(&a, &b, Fp::zero()) == a` entry-by-entry.
-        todo!()
+        let a = vec![Fp::new(10), Fp::new(20), Fp::new(30), Fp::new(40)];
+        let b = vec![Fp::new(7), Fp::new(11), Fp::new(13), Fp::new(17)];
+        let out = combine(&a, &b, Fp::zero());
+        assert_eq!(out, a);
     }
 
-    /// `combine(a, b, 1) = a + b` pointwise.
+    /// `combine(a, b, 1) = a + b` pointwise. Also checks one entry against a
+    /// hand-computed value with `r = 5` to exercise the non-trivial path.
     #[test]
     fn combine_with_r_one_is_pointwise_sum() {
-        // TODO:
-        //   1. Same `a, b` as the previous test.
-        //   2. Assert `combine(&a, &b, Fp::one())[j] == a[j] + b[j]` for all j.
-        //   3. (Bonus: pick a non-trivial `r = Fp::new(5)` and check one entry
-        //      by hand against `a[j] + 5 · b[j]`.)
-        todo!()
+        let a = vec![Fp::new(10), Fp::new(20), Fp::new(30), Fp::new(40)];
+        let b = vec![Fp::new(7), Fp::new(11), Fp::new(13), Fp::new(17)];
+
+        let out_one = combine(&a, &b, Fp::one());
+        for j in 0..a.len() {
+            assert_eq!(out_one[j], a[j] + b[j], "mismatch at j = {}", j);
+        }
+
+        // Bonus: hand-checked entry with r = 5 → a[0] + 5·b[0] = 10 + 35 = 45.
+        let out_five = combine(&a, &b, Fp::new(5));
+        assert_eq!(out_five[0], Fp::new(45));
+        assert_eq!(out_five[1], Fp::new(20) + Fp::new(5) * Fp::new(11));
+    }
+
+    /// `poly_deg_cor` with `e = 0` is the identity (returns input unchanged),
+    /// regardless of `r`. Mirror of the eval-form `e = 0` test above.
+    #[test]
+    fn poly_deg_cor_with_e_zero_is_identity() {
+        let p = UnivariatePoly::new(vec![Fp::new(7), Fp::new(11), Fp::new(13)]);
+        // Even with non-trivial r, e=0 ⇒ g_r ≡ 1 ⇒ result == input.
+        let out = poly_deg_cor(&p, 0, Fp::new(99));
+        assert_eq!(out, p);
+    }
+
+    /// `poly_deg_cor` matches the coefficient-by-coefficient convolution
+    /// against a hand-built `g_r` polynomial. Worked example from the
+    /// module docs: `f(X) = 1 + X`, `e = 2`, `r = 3` ⇒
+    /// `g_r(X) = 1 + 3X + 9X²`, and
+    /// `(1 + X) · (1 + 3X + 9X²) = 1 + 4X + 12X² + 9X³`.
+    #[test]
+    fn poly_deg_cor_matches_hand_computed_convolution() {
+        let f = UnivariatePoly::new(vec![Fp::one(), Fp::one()]); // 1 + X
+        let out = poly_deg_cor(&f, 2, Fp::new(3));
+        // Expected coefficients [1, 4, 12, 9].
+        let expected = UnivariatePoly::new(vec![
+            Fp::new(1),
+            Fp::new(4),
+            Fp::new(12),
+            Fp::new(9),
+        ]);
+        assert_eq!(out, expected);
+        // Degree bumps up by exactly e = 2.
+        assert_eq!(out.degree(), Some(3));
+    }
+
+    /// `poly_deg_cor(f, e, r)` evaluated pointwise on a domain agrees with
+    /// `deg_cor(evals_of_f, domain, e, r)` — i.e., coefficient-form DegCor
+    /// and evaluation-form DegCor produce the same algebraic object (the
+    /// `f · g_r` of the Degree-Correction theorem). This is the load-bearing
+    /// equivalence between the prover's coefficient-form path and the
+    /// (pre-existing) evaluation-form helper.
+    #[test]
+    fn poly_deg_cor_matches_eval_form_on_domain() {
+        let domain = EvaluationDomain::new_subgroup(3); // |L| = 8
+        let f = UnivariatePoly::new(vec![Fp::new(2), Fp::new(5), Fp::new(11), Fp::new(7)]);
+        let r = Fp::new(13);
+        let e = 3usize;
+
+        // Evaluate f on the domain pointwise.
+        let evals: Vec<Fp> = (0..domain.size())
+            .map(|j| f.evaluate(domain.element(j)))
+            .collect();
+
+        // Eval-form DegCor.
+        let evals_corrected = deg_cor(&evals, &domain, e, r);
+
+        // Coef-form DegCor, then evaluate on the domain.
+        let f_corrected = poly_deg_cor(&f, e, r);
+        let poly_corrected_on_domain: Vec<Fp> = (0..domain.size())
+            .map(|j| f_corrected.evaluate(domain.element(j)))
+            .collect();
+
+        assert_eq!(evals_corrected, poly_corrected_on_domain);
+    }
+
+    /// `eval_g_r(r, x, e)` matches the direct geometric sum
+    /// `Σ_{i=0..e} (r·x)^i` at every domain point. Exercises the closed-form
+    /// branch (the `rx == 1` branch is exercised separately below).
+    #[test]
+    fn eval_g_r_matches_direct_sum_on_domain() {
+        let domain = EvaluationDomain::new_subgroup(3); // |L| = 8
+        let r = Fp::new(13);
+        let e = 4usize;
+
+        for j in 0..domain.size() {
+            let x = domain.element(j);
+            let got = eval_g_r(r, x, e);
+
+            // Direct sum.
+            let rx = r * x;
+            let mut expected = Fp::zero();
+            let mut pow = Fp::one();
+            for _ in 0..=e {
+                expected = expected + pow;
+                pow = pow * rx;
+            }
+            assert_eq!(got, expected, "g_r mismatch at L[{j}]");
+        }
+    }
+
+    /// `eval_g_r` triggers the `r·x == 1` L'Hôpital branch and returns
+    /// `e + 1`. Construct it explicitly by picking `x = r^{-1}`.
+    #[test]
+    fn eval_g_r_lhopital_branch_when_rx_is_one() {
+        let r = Fp::new(7);
+        let x = r.inverse().expect("7 ≠ 0 in Goldilocks");
+        // Sanity: r · x == 1.
+        assert_eq!(r * x, Fp::one());
+
+        for &e in &[0usize, 1, 2, 5] {
+            let got = eval_g_r(r, x, e);
+            assert_eq!(
+                got,
+                Fp::new((e as u64) + 1),
+                "L'Hôpital branch must return e + 1 (e = {e})",
+            );
+        }
+    }
+
+    /// Sanity check the closed-form path: pick a tiny case where we can
+    /// compare against a direct sum.
+    ///
+    /// Take e = 3, r = α, and verify g_r(x) = 1 + αx + (αx)^2 + (αx)^3 at
+    /// every domain point. We do this by computing `deg_cor` with `f ≡ 1`
+    /// (all-ones evals) and checking the output equals the direct geometric
+    /// sum evaluated point-by-point.
+    #[test]
+    fn deg_cor_closed_form_matches_direct_sum() {
+        let domain = EvaluationDomain::new_subgroup(3); // |L| = 8
+        let ones = vec![Fp::one(); domain.size()];
+        let alpha = Fp::new(3);
+        let e = 3usize;
+
+        let got = deg_cor(&ones, &domain, e, alpha);
+
+        // Expected: at each x ∈ L, g_r(x) = sum_{i=0..=e} (αx)^i.
+        for (j, x) in domain.iter().enumerate() {
+            let rx = alpha * x;
+            // Direct geometric sum, no closed form.
+            let mut expected = Fp::zero();
+            let mut pow = Fp::one();
+            for _ in 0..=e {
+                expected = expected + pow;
+                pow = pow * rx;
+            }
+            assert_eq!(got[j], expected, "g_r mismatch at L[{}] = {:?}", j, x);
+        }
     }
 }

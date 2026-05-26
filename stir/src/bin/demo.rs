@@ -52,7 +52,10 @@ fn main() {
     let ood_samples: u32 = 1;
     let stopping_degree: usize = 4;
     let initial_degree_bound: usize = 16; // = |L_0| * ρ = 64 * 1/4
-    let repetition_schedule: Vec<u32> = vec![8, 4, 2];
+    // NOTE: We do NOT hard-code a repetition schedule here. The schedule
+    // is derived from `security_bits` by `StirParams` (per-round soundness
+    // `2^{-λ/M}`; for λ = 32, M = 2 this gives ~[8, 6, 4]). Hard-coding
+    // `[8, 4, 2]` would under-shoot the bound and deliver only ~8 bits.
 
     println!("───────────────────────────────────────────────────────────");
     println!("(1) Parameters");
@@ -70,7 +73,6 @@ fn main() {
     println!("  stopping_degree         = {}", stopping_degree);
     println!("  initial_degree_bound    = {}  (= |L_0| · ρ)",
         initial_degree_bound);
-    println!("  repetition_schedule     = {:?}", repetition_schedule);
     println!();
     println!("  Round-by-round sizing (predicted):");
     println!("    Round 0: |L_0| = 64, d_0 = 16, fold ÷ {}, domain ÷ {}",
@@ -89,8 +91,11 @@ fn main() {
     .with_rate_log_inv(rate_log_inv)
     .with_security_bits(security_bits)
     .with_ood_samples(ood_samples)
-    .with_stopping_degree(stopping_degree)
-    .with_repetition_schedule(repetition_schedule.clone());
+    .with_stopping_degree(stopping_degree);
+
+    let repetition_schedule = params.repetition_schedule.clone();
+    println!("  repetition_schedule     = {:?}  (derived from security_bits)",
+        repetition_schedule);
 
     // ════════════════════════════════════════════════════════════════════
     // === Build a test polynomial ===
@@ -150,6 +155,8 @@ fn main() {
             println!("  Proof shape:");
             println!("    round_commitments.len()    = {}",
                 proof.round_commitments.len());
+            println!("    repetition_schedule        = {:?}",
+                repetition_schedule);
             println!("    ood_replies.len()          = {}",
                 proof.ood_replies.len());
             println!("    shift_answers.len()        = {}",
@@ -162,12 +169,19 @@ fn main() {
                 println!("    pow_nonces.len()           = {}",
                     proof.pow_nonces.len());
             }
+            println!();
+            assert!(
+                accepted,
+                "honest demo run must be accepted by the verifier",
+            );
+            println!("  verifier accepted");
         }
         Err(msg) => {
             println!("  run_stir_with_verification returned Err({:?}).", msg);
             println!("  This is the structured-error path — the input was");
             println!("  malformed before any cryptography ran. See the");
             println!("  protocol::run_stir docstring for the validation rules.");
+            panic!("demo: expected Ok(...), got Err({msg:?})");
         }
     }
 
